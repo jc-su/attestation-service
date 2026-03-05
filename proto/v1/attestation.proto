@@ -1,0 +1,228 @@
+// Copyright 2025 Intel Corporation
+// SPDX-License-Identifier: Apache-2.0
+//
+// gRPC service definition for the Attestation Service (Verifier).
+// This is the external Verifier in the IETF RATS architecture (RFC 9334).
+// It receives evidence from the CVM Agent (via virt-handler), verifies it
+// against reference values, and issues attestation result tokens.
+
+syntax = "proto3";
+
+package attestation.v1;
+
+option go_package = "github.com/trustfncall/attestation-service/proto/v1;attestationv1";
+
+// AttestationService is the Verifier in IETF RATS architecture.
+service AttestationService {
+  // VerifyContainerEvidence verifies attestation evidence from a container
+  // and returns a verdict (TRUSTED/UNTRUSTED/STALE) with an attestation token.
+  rpc VerifyContainerEvidence(VerifyRequest) returns (VerifyResponse);
+
+  // SetReferenceValues uploads reference values for a container image.
+  // These are the "known good" measurements that evidence is compared against.
+  rpc SetReferenceValues(SetReferenceValuesRequest) returns (SetReferenceValuesResponse);
+
+  // GetReferenceValues retrieves reference values for a container image.
+  rpc GetReferenceValues(GetReferenceValuesRequest) returns (ReferenceValues);
+
+  // Health checks service health.
+  rpc Health(HealthRequest) returns (HealthResponse);
+
+  // GetLatestVerdict returns the latest verifier verdict for a subject
+  // (for example: "cgroup://<path>" or container image).
+  rpc GetLatestVerdict(GetLatestVerdictRequest) returns (GetLatestVerdictResponse);
+
+  // WatchVerdictUpdates streams verifier verdict changes in real time.
+  // Clients can use this to invalidate trust caches quickly on revocation.
+  rpc WatchVerdictUpdates(WatchVerdictUpdatesRequest) returns (stream VerdictUpdate);
+}
+
+// VerifyRequest contains the attestation evidence to verify.
+message VerifyRequest {
+  // Container identifier (cgroup path).
+  string cgroup_path = 1;
+
+  // VMI name and namespace for correlation.
+  string vmi_name = 2;
+  string vmi_namespace = 3;
+
+  // Current RTMR3 value (hex-encoded SHA-384).
+  string rtmr3 = 4;
+
+  // Initial RTMR3 value (hex-encoded SHA-384).
+  string initial_rtmr3 = 5;
+
+  // Ordered measurement log entries.
+  repeated MeasurementEntry measurements = 6;
+
+  // Challenge nonce (hex-encoded).
+  string nonce = 7;
+
+  // Reportdata = SHA384(nonce || rtmr3), hex-encoded.
+  string report_data = 8;
+
+  // Optional: TDX TD Quote (binary).
+  bytes td_quote = 9;
+
+  // Container image reference (e.g., "docker.io/library/nginx:latest").
+  string container_image = 10;
+}
+
+// MeasurementEntry is a single file measurement.
+message MeasurementEntry {
+  string digest = 1;  // SHA-384 hex
+  string file = 2;    // file path
+}
+
+// Verdict is the trust verdict for a container.
+enum Verdict {
+  VERDICT_UNSPECIFIED = 0;
+  VERDICT_TRUSTED = 1;
+  VERDICT_UNTRUSTED = 2;
+  VERDICT_STALE = 3;
+  VERDICT_UNKNOWN = 4;
+}
+
+// VerifyResponse contains the verification result.
+message VerifyResponse {
+  // Trust verdict.
+  Verdict verdict = 1;
+
+  // Human-readable message explaining the verdict.
+  string message = 2;
+
+  // JWT attestation result token (signed by the service).
+  // Contains the verdict, evidence hash, and timestamp.
+  string attestation_token = 3;
+
+  // Details about what matched/mismatched.
+  VerificationDetails details = 4;
+
+  // Policy-selected remediation action for this verdict (`none|alert|restart|kill`).
+  string policy_action = 5;
+}
+
+// VerificationDetails provides insight into the verification process.
+message VerificationDetails {
+  // Whether RTMR3 replay matched the reported value.
+  bool rtmr3_replay_valid = 1;
+
+  // Whether all required reference values were found in measurements.
+  bool all_required_present = 2;
+
+  // Number of measurements matching reference values.
+  int32 matched_count = 3;
+
+  // Number of measurements not in reference values (unknown files).
+  int32 unknown_count = 4;
+
+  // Number of required reference values missing from measurements.
+  int32 missing_count = 5;
+
+  // Whether the TD Quote signature is valid.
+  bool quote_signature_valid = 6;
+
+  // Whether quote verification was skipped (insecure mode).
+  bool quote_verification_skipped = 7;
+
+  // List of unknown files found in measurements.
+  repeated string unknown_files = 8;
+
+  // List of required files missing from measurements.
+  repeated string missing_files = 9;
+}
+
+// SetReferenceValuesRequest uploads reference values for a container image.
+message SetReferenceValuesRequest {
+  // Container image reference (e.g., "docker.io/library/nginx:latest").
+  string container_image = 1;
+
+  // Reference values to store.
+  ReferenceValues reference_values = 2;
+}
+
+// SetReferenceValuesResponse confirms the upload.
+message SetReferenceValuesResponse {
+  string message = 1;
+}
+
+// GetReferenceValuesRequest retrieves reference values.
+message GetReferenceValuesRequest {
+  string container_image = 1;
+}
+
+// ReferenceValues contains expected measurements for a container image.
+message ReferenceValues {
+  // Container image this applies to.
+  string container_image = 1;
+
+  // Individual file reference entries.
+  repeated ReferenceEntry entries = 2;
+
+  // Timestamp when these values were recorded.
+  int64 created_at = 3;
+}
+
+// ReferenceEntry is a single expected file measurement.
+message ReferenceEntry {
+  // Expected file path in the container.
+  string filename = 1;
+
+  // Expected SHA-384 digest (hex-encoded).
+  string expected_digest = 2;
+
+  // Whether this file is required (must be present for TRUSTED verdict).
+  bool required = 3;
+}
+
+// HealthRequest checks service health.
+message HealthRequest {}
+
+// HealthResponse returns health status.
+message HealthResponse {
+  string status = 1;
+  string version = 2;
+  int64 uptime_seconds = 3;
+}
+
+// GetLatestVerdictRequest queries latest verdict for a subject.
+message GetLatestVerdictRequest {
+  // Subject identity, e.g. "cgroup://<path>".
+  string subject = 1;
+}
+
+// GetLatestVerdictResponse contains the latest known verdict for a subject.
+message GetLatestVerdictResponse {
+  string subject = 1;
+  Verdict verdict = 2;
+  string message = 3;
+  string policy_action = 4;
+  string attestation_token = 5;
+  int64 verified_at = 6;
+  int64 expires_at = 7;
+  uint64 version = 8;
+  string source = 9;
+}
+
+// WatchVerdictUpdatesRequest subscribes to verdict updates.
+message WatchVerdictUpdatesRequest {
+  // Optional subject filter. Empty => all subjects.
+  repeated string subjects = 1;
+
+  // Optional minimum version cursor. Updates with version <= after_version
+  // are omitted from the stream.
+  uint64 after_version = 2;
+}
+
+// VerdictUpdate is emitted on each verdict change.
+message VerdictUpdate {
+  string subject = 1;
+  Verdict verdict = 2;
+  string message = 3;
+  string policy_action = 4;
+  string attestation_token = 5;
+  int64 verified_at = 6;
+  int64 expires_at = 7;
+  uint64 version = 8;
+  string source = 9;
+}

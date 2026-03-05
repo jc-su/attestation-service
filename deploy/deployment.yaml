@@ -1,0 +1,47 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: attestation-service
+  namespace: kubevirt
+  labels:
+    app: attestation-service
+    app.kubernetes.io/component: attestation
+    app.kubernetes.io/part-of: trustfncall
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: attestation-service
+  template:
+    metadata:
+      labels:
+        app: attestation-service
+    spec:
+      serviceAccountName: attestation-service
+      containers:
+        - name: attestation-service
+          image: ghcr.io/trustfncall/attestation-service:latest
+          args:
+            - --addr=:50051
+            - --insecure-skip-quote-verify  # Remove in production
+          ports:
+            - containerPort: 50051
+              name: grpc
+              protocol: TCP
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "100m"
+            limits:
+              memory: "256Mi"
+              cpu: "500m"
+          livenessProbe:
+            grpc:
+              port: 50051
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            grpc:
+              port: 50051
+            initialDelaySeconds: 3
+            periodSeconds: 5
