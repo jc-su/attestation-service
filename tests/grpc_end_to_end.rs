@@ -11,6 +11,9 @@ use attestation_service::token::TokenIssuer;
 use tokio::sync::oneshot;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
+use tonic::{Code, Request};
+
+const TEST_UPDATE_LATEST_VERDICT_TOKEN: &str = "test-update-token";
 
 async fn spawn_server() -> (
     proto::attestation_service_client::AttestationServiceClient<tonic::transport::Channel>,
@@ -47,6 +50,7 @@ async fn spawn_server() -> (
         60,
         std::time::Duration::from_secs(5),
         1024,
+        Some(Arc::<str>::from(TEST_UPDATE_LATEST_VERDICT_TOKEN)),
         "test",
     );
 
@@ -105,6 +109,56 @@ async fn verify_and_health_roundtrip() {
         .into_inner();
     assert_eq!(verify.verdict, proto::Verdict::Unknown as i32);
     assert_eq!(verify.policy_action, "none");
+
+    let _ = shutdown_tx.send(());
+}
+
+#[tokio::test]
+async fn update_latest_verdict_requires_auth_and_roundtrips() {
+    let (mut client, shutdown_tx) = spawn_server().await;
+
+    let err = client
+        .update_latest_verdict(proto::UpdateLatestVerdictRequest {
+            subjects: vec!["cgroup:///cg-update".to_owned()],
+            verdict: proto::Verdict::Stale as i32,
+            message: "heartbeat timeout detected by trustd".to_owned(),
+            policy_action: "restart".to_owned(),
+            source: "kubevirt/trustd".to_owned(),
+        })
+        .await
+        .expect_err("missing auth token should fail");
+    assert_eq!(err.code(), Code::Unauthenticated);
+
+    let mut request = Request::new(proto::UpdateLatestVerdictRequest {
+        subjects: vec!["cgroup:///cg-update".to_owned()],
+        verdict: proto::Verdict::Stale as i32,
+        message: "heartbeat timeout detected by trustd".to_owned(),
+        policy_action: "restart".to_owned(),
+        source: "kubevirt/trustd".to_owned(),
+    });
+    request.metadata_mut().insert(
+        "x-attestation-update-token",
+        TEST_UPDATE_LATEST_VERDICT_TOKEN
+            .parse()
+            .expect("test token should be valid metadata"),
+    );
+
+    let update = client
+        .update_latest_verdict(request)
+        .await
+        .expect("authorized update should succeed")
+        .into_inner();
+    assert_eq!(update.updated, 1);
+
+    let latest = client
+        .get_latest_verdict(proto::GetLatestVerdictRequest {
+            subject: "cgroup:///cg-update".to_owned(),
+        })
+        .await
+        .expect("latest verdict should exist")
+        .into_inner();
+    assert_eq!(latest.verdict, proto::Verdict::Stale as i32);
+    assert_eq!(latest.policy_action, "restart");
 
     let _ = shutdown_tx.send(());
 }

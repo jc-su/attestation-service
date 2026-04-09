@@ -6,9 +6,10 @@ use std::time::Duration;
 use tracing::{info, warn};
 
 use crate::error::{Result, ServiceError};
-use crate::policy::load_compiled_policies;
+use crate::policy::{CompiledPolicies, load_compiled_policies};
 use crate::policy_action_store::PolicyActionStore;
 use crate::refstore::PolicyReferenceStore;
+use crate::service::PolicyReloadHooks;
 
 pub struct PolicyFileSync {
     store: Arc<dyn PolicyReferenceStore>,
@@ -16,6 +17,8 @@ pub struct PolicyFileSync {
     paths: Vec<PathBuf>,
     interval: Duration,
     applied_policy_ids: RwLock<HashSet<String>>,
+    last_compiled: RwLock<Option<CompiledPolicies>>,
+    policy_reload_hooks: Option<PolicyReloadHooks>,
 }
 
 impl PolicyFileSync {
@@ -24,6 +27,7 @@ impl PolicyFileSync {
         action_store: Arc<dyn PolicyActionStore>,
         paths: Vec<PathBuf>,
         interval: Duration,
+        policy_reload_hooks: Option<PolicyReloadHooks>,
     ) -> Self {
         Self {
             store,
@@ -31,19 +35,35 @@ impl PolicyFileSync {
             paths,
             interval,
             applied_policy_ids: RwLock::new(HashSet::new()),
+            last_compiled: RwLock::new(None),
+            policy_reload_hooks,
         }
     }
 
-    pub fn sync_once(&self) -> Result<usize> {
+    pub async fn sync_once(&self) -> Result<usize> {
         let compiled = load_compiled_policies(self.paths.as_slice())?;
+        let changed = {
+            let guard = self
+                .last_compiled
+                .read()
+                .map_err(|_| ServiceError::Internal("policy sync lock poisoned".to_owned()))?;
+            guard.as_ref() != Some(&compiled)
+        };
+        if !changed {
+            let guard = self
+                .applied_policy_ids
+                .read()
+                .map_err(|_| ServiceError::Internal("policy sync lock poisoned".to_owned()))?;
+            return Ok(guard.len());
+        }
 
         let new_ids: HashSet<String> = compiled.keys().cloned().collect();
-        for (policy_id, selector_entries) in compiled {
+        for (policy_id, selector_entries) in &compiled {
             let mut entries = std::collections::HashMap::with_capacity(selector_entries.len());
             let mut actions = std::collections::HashMap::with_capacity(selector_entries.len());
             for (selector, selector_policy) in selector_entries {
-                entries.insert(selector.clone(), selector_policy.entries);
-                actions.insert(selector, selector_policy.actions);
+                entries.insert(selector.clone(), selector_policy.entries.clone());
+                actions.insert(selector.clone(), selector_policy.actions);
             }
 
             self.store.replace_policy(&policy_id, entries)?;
@@ -61,17 +81,33 @@ impl PolicyFileSync {
             self.action_store.remove_policy_actions(removed_id)?;
         }
 
-        let mut guard = self
-            .applied_policy_ids
-            .write()
-            .map_err(|_| ServiceError::Internal("policy sync lock poisoned".to_owned()))?;
-        *guard = new_ids;
-        Ok(guard.len())
+        let applied_count = new_ids.len();
+        {
+            let mut guard = self
+                .applied_policy_ids
+                .write()
+                .map_err(|_| ServiceError::Internal("policy sync lock poisoned".to_owned()))?;
+            *guard = new_ids;
+        }
+
+        {
+            let mut last = self
+                .last_compiled
+                .write()
+                .map_err(|_| ServiceError::Internal("policy sync lock poisoned".to_owned()))?;
+            *last = Some(compiled);
+        }
+
+        if let Some(hooks) = &self.policy_reload_hooks {
+            hooks.invalidate().await;
+        }
+
+        Ok(applied_count)
     }
 
     pub fn start(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
-            if let Err(error) = self.sync_once() {
+            if let Err(error) = self.sync_once().await {
                 warn!(error = %error, "initial policy sync failed");
             } else {
                 info!("initial policy sync completed");
@@ -80,7 +116,7 @@ impl PolicyFileSync {
             let mut ticker = tokio::time::interval(self.interval);
             loop {
                 ticker.tick().await;
-                match self.sync_once() {
+                match self.sync_once().await {
                     Ok(count) => info!(policy_count = count, "policy sync completed"),
                     Err(error) => warn!(error = %error, "policy sync failed"),
                 }
@@ -99,8 +135,8 @@ mod tests {
     use crate::policy_action_store::InMemoryPolicyActionStore;
     use crate::refstore::{MemoryStore, ReferenceStore};
 
-    #[test]
-    fn sync_once_applies_and_removes_policies() {
+    #[tokio::test]
+    async fn sync_once_applies_and_removes_policies() {
         let dir = tempfile::tempdir().expect("temp dir should exist");
         let policy_path = dir.path().join("policy.yaml");
 
@@ -128,12 +164,13 @@ spec:
             action_store,
             vec![policy_path.clone()],
             Duration::from_secs(30),
+            None,
         );
-        sync.sync_once().expect("sync should succeed");
+        sync.sync_once().await.expect("sync should succeed");
         assert!(store.get("cgroup:///kubepods/pod-x").is_ok());
 
         fs::write(&policy_path, "").expect("write should succeed");
-        sync.sync_once().expect("sync should succeed");
+        sync.sync_once().await.expect("sync should succeed");
         assert!(store.get("cgroup:///kubepods/pod-x").is_err());
     }
 }

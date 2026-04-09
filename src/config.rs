@@ -59,6 +59,10 @@ pub struct Config {
     #[arg(long)]
     pub jwt_secret_path: Option<PathBuf>,
 
+    /// Optional path to a shared token authorizing UpdateLatestVerdict callers.
+    #[arg(long)]
+    pub update_latest_verdict_token_path: Option<PathBuf>,
+
     /// JSON file where manual reference values are persisted.
     #[arg(long, default_value = DEFAULT_REFERENCE_STORE_PATH)]
     pub reference_store_path: PathBuf,

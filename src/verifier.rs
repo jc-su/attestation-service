@@ -281,7 +281,7 @@ where
                 .push("no measurements recorded (container may not have started)".to_owned());
         }
 
-        let (verdict, message) = if !hard_failures.is_empty() {
+        let (mut verdict, mut message) = if !hard_failures.is_empty() {
             (
                 TrustVerdict::Untrusted,
                 format!("verification failed: {}", hard_failures.join("; ")),
@@ -329,6 +329,12 @@ where
                 ),
             }
         };
+
+        if req.td_quote.is_empty() && matches!(verdict, TrustVerdict::Trusted | TrustVerdict::Stale)
+        {
+            verdict = TrustVerdict::Unknown;
+            message = format!("{message}; td quote missing; attestation trust requires a TD quote");
+        }
 
         Ok(VerificationResult {
             verdict,
@@ -645,7 +651,7 @@ mod tests {
     }
 
     #[test]
-    fn verifier_uses_cgroup_identity_when_image_missing() {
+    fn verifier_requires_td_quote_when_cgroup_reference_matches() {
         let store = Arc::new(MemoryStore::new());
         store
             .set(
@@ -680,11 +686,12 @@ mod tests {
             })
             .expect("verification should succeed");
 
-        assert_eq!(result.verdict, TrustVerdict::Trusted);
+        assert_eq!(result.verdict, TrustVerdict::Unknown);
+        assert!(result.message.contains("td quote missing"));
     }
 
     #[test]
-    fn verifier_trusted_when_reference_matches() {
+    fn verifier_requires_td_quote_even_when_reference_matches() {
         let store = Arc::new(MemoryStore::new());
         store
             .set(
@@ -719,7 +726,8 @@ mod tests {
             })
             .expect("verification should succeed");
 
-        assert_eq!(result.verdict, TrustVerdict::Trusted);
+        assert_eq!(result.verdict, TrustVerdict::Unknown);
+        assert!(result.message.contains("td quote missing"));
     }
 
     #[test]

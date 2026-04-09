@@ -1,4 +1,5 @@
 use std::error::Error;
+use std::path::Path;
 use std::sync::Arc;
 
 use attestation_service::config::Config;
@@ -44,14 +45,35 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let policy_store: Arc<dyn PolicyReferenceStore> = store;
     let policy_action_store = Arc::new(InMemoryPolicyActionStore::new());
 
+    let quote_backend = QuoteVerifierBackend::from_config(config.quote_backend_config())?;
+    let update_latest_verdict_token = load_optional_secret(
+        config.update_latest_verdict_token_path.as_deref(),
+        "--update-latest-verdict-token-path",
+    )?;
+    if update_latest_verdict_token.is_none() {
+        warn!("no --update-latest-verdict-token-path provided; UpdateLatestVerdict is disabled");
+    }
+    let service = AttestationService::new(
+        reference_store,
+        policy_action_store.clone(),
+        token_issuer,
+        quote_backend,
+        config.token_ttl_seconds as i64,
+        config.verify_cache_ttl(),
+        config.verify_cache_max_entries,
+        update_latest_verdict_token,
+        env!("CARGO_PKG_VERSION"),
+    );
+
     let _policy_sync_handle = if !config.policy_file.is_empty() {
         let sync = Arc::new(PolicyFileSync::new(
             policy_store,
-            policy_action_store.clone(),
+            policy_action_store,
             config.policy_file.clone(),
             config.policy_reload_interval(),
+            Some(service.policy_reload_hooks()),
         ));
-        match sync.sync_once() {
+        match sync.sync_once().await {
             Ok(count) => info!(policy_count = count, "initial policy sync completed"),
             Err(error) => warn!(error = %error, "initial policy sync failed"),
         }
@@ -59,18 +81,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
     } else {
         None
     };
-
-    let quote_backend = QuoteVerifierBackend::from_config(config.quote_backend_config())?;
-    let service = AttestationService::new(
-        reference_store,
-        policy_action_store,
-        token_issuer,
-        quote_backend,
-        config.token_ttl_seconds as i64,
-        config.verify_cache_ttl(),
-        config.verify_cache_max_entries,
-        env!("CARGO_PKG_VERSION"),
-    );
     let grpc_service = proto::attestation_service_server::AttestationServiceServer::new(service);
 
     let listen_addr = config.addr.parse()?;
@@ -79,6 +89,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .serve_with_shutdown(listen_addr, shutdown_signal())
         .await
         .map_err(Box::<dyn Error>::from)
+}
+
+fn load_optional_secret(
+    path: Option<&Path>,
+    flag_name: &str,
+) -> Result<Option<Arc<str>>, Box<dyn Error>> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let value = std::fs::read_to_string(path)?;
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(format!("{flag_name} file {} is empty", path.display()).into());
+    }
+    Ok(Some(Arc::<str>::from(trimmed)))
 }
 
 async fn shutdown_signal() {

@@ -10,7 +10,7 @@ use crate::refstore::ReferenceEntry;
 
 pub type CompiledPolicies = HashMap<String, HashMap<String, CompiledPolicySelector>>;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompiledPolicySelector {
     pub entries: Vec<ReferenceEntry>,
     pub actions: SelectorPolicyAction,

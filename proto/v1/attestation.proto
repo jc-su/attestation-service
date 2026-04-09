@@ -28,6 +28,10 @@ service AttestationService {
   // Health checks service health.
   rpc Health(HealthRequest) returns (HealthResponse);
 
+  // UpdateLatestVerdict force-updates latest verdicts for subjects.
+  // Used for fast revocation paths such as heartbeat loss or remediation state.
+  rpc UpdateLatestVerdict(UpdateLatestVerdictRequest) returns (UpdateLatestVerdictResponse);
+
   // GetLatestVerdict returns the latest verifier verdict for a subject
   // (for example: "cgroup://<path>" or container image).
   rpc GetLatestVerdict(GetLatestVerdictRequest) returns (GetLatestVerdictResponse);
@@ -183,6 +187,21 @@ message HealthResponse {
   string status = 1;
   string version = 2;
   int64 uptime_seconds = 3;
+}
+
+// UpdateLatestVerdictRequest force-updates latest verdicts for subjects.
+message UpdateLatestVerdictRequest {
+  // Subject identities, e.g. "cgroup://<path>".
+  repeated string subjects = 1;
+  Verdict verdict = 2;
+  string message = 3;
+  string policy_action = 4;
+  string source = 5;
+}
+
+// UpdateLatestVerdictResponse confirms how many subjects were updated.
+message UpdateLatestVerdictResponse {
+  uint32 updated = 1;
 }
 
 // GetLatestVerdictRequest queries latest verdict for a subject.
