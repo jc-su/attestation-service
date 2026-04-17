@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::{RwLock, broadcast, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
@@ -11,12 +11,11 @@ use tracing::warn;
 use crate::policy_action_store::{PolicyAction, PolicyActionStore, PolicyCondition};
 use crate::proto;
 use crate::quote_backend::QuoteVerifierBackend;
-use crate::refstore::{ReferenceEntry, ReferenceStore};
+use crate::refstore::{ReferenceEntry, ReferenceStore, TcbReferenceStore};
 use crate::token::{TokenClaims, TokenIssuer};
-use crate::verification_cache::{InFlightTurn, VerificationResultCache};
-use crate::verifier::{MeasurementLog, TrustVerdict, VerificationResult, Verifier, VerifyRequest};
+use crate::verifier::{TrustVerdict, Verifier, WorkloadVerifyRequest, WorkloadVerifyResult};
 
-const VERDICT_SOURCE: &str = "attestation-service/verify_container_evidence";
+const VERDICT_SOURCE: &str = "attestation-service/verify_workload";
 const VERDICT_EXPIRED_SOURCE: &str = "attestation-service/verdict-expired";
 const VERDICT_REFERENCE_VALUES_SOURCE: &str = "attestation-service/reference-values-updated";
 const VERDICT_MANUAL_UPDATE_SOURCE: &str = "attestation-service/update-latest-verdict";
@@ -246,13 +245,11 @@ impl VerdictStore {
 
 #[derive(Clone)]
 pub struct PolicyReloadHooks {
-    verify_cache: Arc<VerificationResultCache>,
     verdict_store: Arc<VerdictStore>,
 }
 
 impl PolicyReloadHooks {
-    async fn invalidate_internal(&self) {
-        self.verify_cache.invalidate_all().await;
+    pub async fn invalidate(&self) {
         let now = unix_seconds(SystemTime::now());
         let _ = self
             .verdict_store
@@ -262,10 +259,6 @@ impl PolicyReloadHooks {
                 REFERENCE_VALUES_UPDATED_MESSAGE,
             )
             .await;
-    }
-
-    pub async fn invalidate(&self) {
-        self.invalidate_internal().await;
     }
 }
 
@@ -281,11 +274,9 @@ fn append_message(base: &str, extra: &str) -> String {
 
 pub struct AttestationService {
     verifier: Verifier<Arc<dyn ReferenceStore>>,
-    store: Arc<dyn ReferenceStore>,
     policy_actions: Arc<dyn PolicyActionStore>,
     token_issuer: TokenIssuer,
     verdict_store: Arc<VerdictStore>,
-    verify_cache: Arc<VerificationResultCache>,
     update_latest_verdict_token: Option<Arc<str>>,
     version: Arc<str>,
     started_at: Instant,
@@ -298,30 +289,29 @@ impl AttestationService {
         token_issuer: TokenIssuer,
         quote_backend: QuoteVerifierBackend,
         verdict_ttl_seconds: i64,
-        verify_cache_ttl: Duration,
-        verify_cache_max_entries: usize,
         update_latest_verdict_token: Option<Arc<str>>,
         version: impl Into<Arc<str>>,
     ) -> Self {
         Self {
-            verifier: Verifier::new(Arc::clone(&store), quote_backend),
-            store,
+            verifier: Verifier::new(store, quote_backend),
             policy_actions,
             token_issuer,
             verdict_store: Arc::new(VerdictStore::new(verdict_ttl_seconds)),
-            verify_cache: Arc::new(VerificationResultCache::new(
-                verify_cache_ttl,
-                verify_cache_max_entries,
-            )),
             update_latest_verdict_token,
             version: version.into(),
             started_at: Instant::now(),
         }
     }
 
+    /// Builder-style: attach a TCB reference store so `verify_workload`
+    /// can check RTMR[2] against a known-good kernel allow-list.
+    pub fn with_tcb_store(mut self, tcb: Arc<dyn TcbReferenceStore>) -> Self {
+        self.verifier = self.verifier.with_tcb_store(tcb);
+        self
+    }
+
     pub fn policy_reload_hooks(&self) -> PolicyReloadHooks {
         PolicyReloadHooks {
-            verify_cache: Arc::clone(&self.verify_cache),
             verdict_store: Arc::clone(&self.verdict_store),
         }
     }
@@ -335,63 +325,54 @@ impl AttestationService {
         }
     }
 
-    fn build_token_claims(
-        request: &proto::VerifyRequest,
-        result: &VerificationResult,
-        policy_action: PolicyAction,
-    ) -> TokenClaims {
-        TokenClaims {
-            verdict: result.verdict.as_str().to_owned(),
-            policy_action: policy_action.as_str().to_owned(),
-            cgroup_path: request.cgroup_path.clone(),
-            container_image: request.container_image.clone(),
-            vmi_name: request.vmi_name.clone(),
-            vmi_namespace: request.vmi_namespace.clone(),
-            rtmr3: request.rtmr3.clone(),
-            measurement_count: request.measurements.len() as i32,
-            matched_count: result.matched_count,
-            unknown_count: result.unknown_count,
-            rtmr3_replay_valid: result.rtmr3_replay_valid,
-            all_required_present: result.all_required_present,
-            quote_verified: result.quote_signature_valid,
-        }
-    }
-
-    fn resolve_policy_action(
-        &self,
-        request: &proto::VerifyRequest,
-        verdict: TrustVerdict,
-    ) -> PolicyAction {
+    fn resolve_policy_action(&self, workload_id: &str, verdict: TrustVerdict) -> PolicyAction {
         let condition = match verdict {
             TrustVerdict::Untrusted => PolicyCondition::Untrusted,
             TrustVerdict::Stale => PolicyCondition::Stale,
             TrustVerdict::Trusted | TrustVerdict::Unknown => return PolicyAction::None,
         };
-
-        let mut identities = Vec::with_capacity(2);
-        if !request.container_image.is_empty() {
-            identities.push(request.container_image.clone());
-        }
-        if !request.cgroup_path.is_empty() {
-            identities.push(format!("cgroup://{}", request.cgroup_path));
-        }
-
+        let identities = [format!("workload://{workload_id}")];
         self.policy_actions.resolve_action(&identities, condition)
     }
 
-    fn verdict_subjects(request: &proto::VerifyRequest) -> Vec<String> {
-        let mut subjects = HashSet::new();
-
-        if !request.cgroup_path.is_empty() {
-            subjects.insert(format!("cgroup://{}", request.cgroup_path));
+    fn build_workload_token_claims(
+        workload_id: &str,
+        result: &WorkloadVerifyResult,
+        policy_action: PolicyAction,
+    ) -> TokenClaims {
+        TokenClaims {
+            verdict: result.verdict.as_str().to_owned(),
+            policy_action: policy_action.as_str().to_owned(),
+            cgroup_path: String::new(),
+            container_image: format!("workload://{workload_id}"),
+            vmi_name: String::new(),
+            vmi_namespace: String::new(),
+            rtmr3: String::new(),
+            measurement_count: (result.matched_count + result.unknown_count) as i32,
+            matched_count: result.matched_count,
+            unknown_count: result.unknown_count,
+            rtmr3_replay_valid: false,
+            all_required_present: result.all_required_present,
+            quote_verified: result.quote_signature_valid,
         }
-        if !request.container_image.is_empty() {
-            subjects.insert(request.container_image.clone());
-        }
+    }
 
-        let mut result = subjects.into_iter().collect::<Vec<_>>();
-        result.sort();
-        result
+    async fn publish_workload_verdict(&self, workload_id: &str, response: &proto::VerifyWorkloadResponse) {
+        let subject = format!("workload://{workload_id}");
+        let now = unix_seconds(SystemTime::now());
+        let expires_at = now.saturating_add(self.verdict_store.ttl_seconds());
+        let record = VerdictRecord {
+            subject,
+            verdict: response.verdict,
+            message: response.message.clone(),
+            policy_action: response.policy_action.clone(),
+            attestation_token: response.attestation_token.clone(),
+            verified_at: now,
+            expires_at,
+            version: self.verdict_store.allocate_version(),
+            source: VERDICT_SOURCE.to_owned(),
+        };
+        self.verdict_store.upsert(record).await;
     }
 
     fn authorize_update_latest_verdict(
@@ -418,145 +399,76 @@ impl AttestationService {
 
         Ok(())
     }
-
-    async fn publish_latest_verdict(
-        &self,
-        request: &proto::VerifyRequest,
-        response: &proto::VerifyResponse,
-    ) {
-        let subjects = Self::verdict_subjects(request);
-        if subjects.is_empty() {
-            return;
-        }
-
-        let now = unix_seconds(SystemTime::now());
-        let expires_at = now.saturating_add(self.verdict_store.ttl_seconds());
-
-        for subject in subjects {
-            let record = VerdictRecord {
-                subject,
-                verdict: response.verdict,
-                message: response.message.clone(),
-                policy_action: response.policy_action.clone(),
-                attestation_token: response.attestation_token.clone(),
-                verified_at: now,
-                expires_at,
-                version: self.verdict_store.allocate_version(),
-                source: VERDICT_SOURCE.to_owned(),
-            };
-            self.verdict_store.upsert(record).await;
-        }
-    }
-
-    async fn evaluate_verify_request(
-        &self,
-        request: &proto::VerifyRequest,
-    ) -> Result<proto::VerifyResponse, Status> {
-        let verify_request = VerifyRequest {
-            cgroup_path: request.cgroup_path.clone(),
-            rtmr3_hex: request.rtmr3.clone(),
-            initial_rtmr3_hex: request.initial_rtmr3.clone(),
-            measurements: request
-                .measurements
-                .iter()
-                .map(|measurement| MeasurementLog {
-                    digest: measurement.digest.clone(),
-                    filename: measurement.file.clone(),
-                })
-                .collect(),
-            nonce_hex: request.nonce.clone(),
-            report_data_hex: request.report_data.clone(),
-            td_quote: request.td_quote.clone(),
-            container_image: request.container_image.clone(),
-        };
-
-        let result = self
-            .verifier
-            .verify(&verify_request)
-            .map_err(|error| Status::internal(format!("verification failed: {error}")))?;
-        let policy_action = self.resolve_policy_action(request, result.verdict.clone());
-        let policy_action_value = policy_action.as_str().to_owned();
-
-        let attestation_token = if let Some(token) = result.attestation_token.clone() {
-            token
-        } else {
-            let token_claims = Self::build_token_claims(request, &result, policy_action);
-            match self.token_issuer.issue(&token_claims) {
-                Ok(token) => token,
-                Err(error) => {
-                    warn!(error = %error, "token issuance failed; returning verdict without token");
-                    String::new()
-                }
-            }
-        };
-
-        Ok(proto::VerifyResponse {
-            verdict: Self::map_verdict(result.verdict),
-            message: result.message,
-            attestation_token,
-            details: Some(proto::VerificationDetails {
-                rtmr3_replay_valid: result.rtmr3_replay_valid,
-                all_required_present: result.all_required_present,
-                matched_count: result.matched_count,
-                unknown_count: result.unknown_count,
-                missing_count: result.missing_count,
-                quote_signature_valid: result.quote_signature_valid,
-                quote_verification_skipped: result.quote_verification_skipped,
-                unknown_files: result.unknown_files,
-                missing_files: result.missing_files,
-            }),
-            policy_action: policy_action_value,
-        })
-    }
 }
 
 #[tonic::async_trait]
 impl proto::attestation_service_server::AttestationService for AttestationService {
     type WatchVerdictUpdatesStream = ReceiverStream<Result<proto::VerdictUpdate, Status>>;
 
-    async fn verify_container_evidence(
+    async fn verify_workload(
         &self,
-        request: Request<proto::VerifyRequest>,
-    ) -> Result<Response<proto::VerifyResponse>, Status> {
+        request: Request<proto::VerifyWorkloadRequest>,
+    ) -> Result<Response<proto::VerifyWorkloadResponse>, Status> {
         let request = request.into_inner();
-
-        if request.cgroup_path.is_empty() {
-            return Err(Status::invalid_argument("cgroup_path required"));
+        if request.workload_id.is_empty() {
+            return Err(Status::invalid_argument("workload_id required"));
         }
-        if request.rtmr3.is_empty() {
-            return Err(Status::invalid_argument("rtmr3 required"));
-        }
-        let cache_key = self.verify_cache.key_for_request(&request);
-        if let Some(cached) = self.verify_cache.get(cache_key).await {
-            return Ok(Response::new(cached));
+        if request.nonce_hex.is_empty() {
+            return Err(Status::invalid_argument("nonce_hex required"));
         }
 
-        match self.verify_cache.begin(cache_key).await {
-            InFlightTurn::Wait(rx) => match rx.await {
-                Ok(Ok(response)) => return Ok(Response::new(response)),
-                Ok(Err(message)) => return Err(Status::internal(message)),
-                Err(_) => {
-                    // Fall through and become leader if the original call was dropped.
+        let result = self
+            .verifier
+            .verify_workload(&WorkloadVerifyRequest {
+                workload_id: request.workload_id.clone(),
+                td_quote: request.td_quote,
+                event_log: request.event_log,
+                nonce_hex: request.nonce_hex,
+                peer_pk: request.peer_pk,
+            })
+            .map_err(|error| Status::internal(format!("verify_workload failed: {error}")))?;
+
+        let policy_action = self.resolve_policy_action(&request.workload_id, result.verdict.clone());
+        let policy_action_value = policy_action.as_str().to_owned();
+
+        let attestation_token = if matches!(result.verdict, TrustVerdict::Trusted) {
+            let claims = Self::build_workload_token_claims(
+                &request.workload_id,
+                &result,
+                policy_action,
+            );
+            match self.token_issuer.issue(&claims) {
+                Ok(token) => token,
+                Err(error) => {
+                    warn!(error = %error, "token issuance failed; returning verdict without token");
+                    String::new()
                 }
-            },
-            InFlightTurn::Leader => {}
-        }
+            }
+        } else {
+            String::new()
+        };
 
-        match self.evaluate_verify_request(&request).await {
-            Ok(response) => {
-                self.publish_latest_verdict(&request, &response).await;
-                self.verify_cache
-                    .finish(cache_key, Ok(response.clone()))
-                    .await;
-                Ok(Response::new(response))
-            }
-            Err(error) => {
-                self.verify_cache
-                    .finish(cache_key, Err(error.message().to_owned()))
-                    .await;
-                Err(error)
-            }
-        }
+        let response = proto::VerifyWorkloadResponse {
+            verdict: Self::map_verdict(result.verdict.clone()),
+            message: result.message,
+            attestation_token,
+            details: Some(proto::WorkloadVerificationDetails {
+                quote_signature_valid: result.quote_signature_valid,
+                quote_verification_skipped: result.quote_verification_skipped,
+                tcb_matches: result.tcb_matches,
+                report_data_valid: result.report_data_valid,
+                matched_count: result.matched_count,
+                unknown_count: result.unknown_count,
+                missing_count: result.missing_count,
+                all_required_present: result.all_required_present,
+                unknown_files: result.unknown_files,
+                missing_files: result.missing_files,
+            }),
+            policy_action: policy_action_value,
+        };
+
+        self.publish_workload_verdict(&request.workload_id, &response).await;
+        Ok(Response::new(response))
     }
 
     async fn set_reference_values(
@@ -583,10 +495,11 @@ impl proto::attestation_service_server::AttestationService for AttestationServic
             })
             .collect::<Vec<_>>();
 
-        self.store
+        // The new-contract caller keys by workload_id, not container_image.
+        // Keep the field name for backward compatibility on the wire.
+        self.verifier_ref_store()
             .set(&request.container_image, entries)
             .map_err(|error| Status::internal(format!("set reference values failed: {error}")))?;
-        self.verify_cache.invalidate_all().await;
         let now = unix_seconds(SystemTime::now());
         let _ = self
             .verdict_store
@@ -612,12 +525,15 @@ impl proto::attestation_service_server::AttestationService for AttestationServic
             return Err(Status::invalid_argument("container_image required"));
         }
 
-        let values = self.store.get(&request.container_image).map_err(|error| {
-            Status::not_found(format!(
-                "reference values for {} not found: {error}",
-                request.container_image
-            ))
-        })?;
+        let values = self
+            .verifier_ref_store()
+            .get(&request.container_image)
+            .map_err(|error| {
+                Status::not_found(format!(
+                    "reference values for {} not found: {error}",
+                    request.container_image
+                ))
+            })?;
 
         let response = proto::ReferenceValues {
             container_image: values.container_image,
@@ -743,7 +659,6 @@ impl proto::attestation_service_server::AttestationService for AttestationServic
             .expire_due_records(now, VERDICT_EXPIRED_SOURCE, EXPIRED_VERDICT_MESSAGE)
             .await;
 
-        // Send current snapshot entries newer than after_version first.
         let initial = self.verdict_store.list_since(after_version).await;
         for record in initial {
             if let Some(subject_filter) = &subjects {
@@ -756,7 +671,6 @@ impl proto::attestation_service_server::AttestationService for AttestationServic
             }
         }
 
-        // Then stream live updates.
         let mut updates = self.verdict_store.subscribe();
         tokio::spawn(async move {
             let mut cursor = after_version;
@@ -776,16 +690,19 @@ impl proto::attestation_service_server::AttestationService for AttestationServic
                             break;
                         }
                     }
-                    Err(broadcast::error::RecvError::Lagged(_)) => {
-                        // Keep streaming the freshest updates.
-                        continue;
-                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
         });
 
         Ok(Response::new(ReceiverStream::new(rx)))
+    }
+}
+
+impl AttestationService {
+    fn verifier_ref_store(&self) -> &Arc<dyn ReferenceStore> {
+        self.verifier.ref_store()
     }
 }
 
@@ -808,15 +725,11 @@ mod tests {
 
     const TEST_UPDATE_LATEST_VERDICT_TOKEN: &str = "test-update-token";
 
-    fn new_service() -> AttestationService {
-        new_service_with_update_token(Some(TEST_UPDATE_LATEST_VERDICT_TOKEN))
-    }
-
     fn new_service_with_update_token(update_token: Option<&str>) -> AttestationService {
         let store = Arc::new(MemoryStore::new());
         store
             .set(
-                "img",
+                "wl-1",
                 vec![ReferenceEntry {
                     filename: "/a".to_owned(),
                     expected_digest: "01".repeat(48),
@@ -842,11 +755,13 @@ mod tests {
             issuer,
             quote_backend,
             60,
-            std::time::Duration::from_secs(5),
-            1024,
             update_token.map(Arc::<str>::from),
             "test",
         )
+    }
+
+    fn new_service() -> AttestationService {
+        new_service_with_update_token(Some(TEST_UPDATE_LATEST_VERDICT_TOKEN))
     }
 
     fn authenticated_update_request(
@@ -876,127 +791,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn verify_rejects_empty_cgroup() {
+    async fn verify_workload_rejects_empty_workload_id() {
         let service = new_service();
         let err = service
-            .verify_container_evidence(Request::new(proto::VerifyRequest::default()))
+            .verify_workload(Request::new(proto::VerifyWorkloadRequest::default()))
             .await
             .expect_err("invalid request should fail");
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
     }
 
     #[tokio::test]
-    async fn verify_response_contains_policy_action_field() {
+    async fn get_latest_verdict_after_verify_workload() {
         let service = new_service();
-        let response = service
-            .verify_container_evidence(Request::new(proto::VerifyRequest {
-                cgroup_path: "cg1".to_owned(),
-                rtmr3: "00".repeat(48),
-                initial_rtmr3: "00".repeat(48),
-                ..proto::VerifyRequest::default()
+        // Empty event_log + missing td_quote → verify returns a verdict,
+        // which we publish. We only need a response to exist, not Trusted.
+        let _ = service
+            .verify_workload(Request::new(proto::VerifyWorkloadRequest {
+                workload_id: "wl-1".to_owned(),
+                nonce_hex: "ab".repeat(32),
+                td_quote: Vec::new(),
+                event_log: Vec::new(),
+                peer_pk: Vec::new(),
             }))
             .await
-            .expect("verify should succeed")
-            .into_inner();
-
-        assert_eq!(response.policy_action, "none");
-    }
-
-    #[tokio::test]
-    async fn get_latest_verdict_returns_last_published_verdict() {
-        let service = new_service();
-        let verify_response = service
-            .verify_container_evidence(Request::new(proto::VerifyRequest {
-                cgroup_path: "cg1".to_owned(),
-                rtmr3: "00".repeat(48),
-                initial_rtmr3: "00".repeat(48),
-                ..proto::VerifyRequest::default()
-            }))
-            .await
-            .expect("verify should succeed")
-            .into_inner();
+            .expect("verify_workload should succeed");
 
         let latest = service
             .get_latest_verdict(Request::new(proto::GetLatestVerdictRequest {
-                subject: "cgroup://cg1".to_owned(),
+                subject: "workload://wl-1".to_owned(),
             }))
             .await
             .expect("latest verdict should exist")
             .into_inner();
 
-        assert_eq!(latest.subject, "cgroup://cg1");
-        assert_eq!(latest.verdict, verify_response.verdict);
+        assert_eq!(latest.subject, "workload://wl-1");
         assert!(!latest.source.is_empty());
-    }
-
-    #[tokio::test]
-    async fn verify_cache_hit_does_not_republish_verdict() {
-        let service = new_service();
-        let request = proto::VerifyRequest {
-            cgroup_path: "cg-cache".to_owned(),
-            rtmr3: "00".repeat(48),
-            initial_rtmr3: "00".repeat(48),
-            ..proto::VerifyRequest::default()
-        };
-
-        service
-            .verify_container_evidence(Request::new(request.clone()))
-            .await
-            .expect("first verify should succeed");
-        let first = service
-            .get_latest_verdict(Request::new(proto::GetLatestVerdictRequest {
-                subject: "cgroup://cg-cache".to_owned(),
-            }))
-            .await
-            .expect("latest verdict should exist")
-            .into_inner();
-
-        service
-            .verify_container_evidence(Request::new(request))
-            .await
-            .expect("second verify should succeed");
-        let second = service
-            .get_latest_verdict(Request::new(proto::GetLatestVerdictRequest {
-                subject: "cgroup://cg-cache".to_owned(),
-            }))
-            .await
-            .expect("latest verdict should exist")
-            .into_inner();
-
-        assert_eq!(first.version, second.version);
-    }
-
-    #[tokio::test]
-    async fn get_latest_verdict_expires_trusted_record_to_stale() {
-        let service = new_service();
-        service
-            .verdict_store
-            .upsert(VerdictRecord {
-                subject: "cgroup:///expired".to_owned(),
-                verdict: proto::Verdict::Trusted as i32,
-                message: "trusted".to_owned(),
-                policy_action: "none".to_owned(),
-                attestation_token: "token".to_owned(),
-                verified_at: 100,
-                expires_at: 101,
-                version: 1,
-                source: VERDICT_SOURCE.to_owned(),
-            })
-            .await;
-
-        let latest = service
-            .get_latest_verdict(Request::new(proto::GetLatestVerdictRequest {
-                subject: "cgroup:///expired".to_owned(),
-            }))
-            .await
-            .expect("latest verdict should exist")
-            .into_inner();
-
-        assert_eq!(latest.verdict, proto::Verdict::Stale as i32);
-        assert_eq!(latest.source, VERDICT_EXPIRED_SOURCE);
-        assert!(latest.message.contains(EXPIRED_VERDICT_MESSAGE));
-        assert!(latest.attestation_token.is_empty());
-        assert!(latest.version > 1);
     }
 
     #[tokio::test]
@@ -1005,7 +834,7 @@ mod tests {
         service
             .verdict_store
             .upsert(VerdictRecord {
-                subject: "cgroup:///cg-ref".to_owned(),
+                subject: "workload://wl-ref".to_owned(),
                 verdict: proto::Verdict::Trusted as i32,
                 message: "trusted".to_owned(),
                 policy_action: "none".to_owned(),
@@ -1019,9 +848,9 @@ mod tests {
 
         service
             .set_reference_values(Request::new(proto::SetReferenceValuesRequest {
-                container_image: "img".to_owned(),
+                container_image: "wl-1".to_owned(),
                 reference_values: Some(proto::ReferenceValues {
-                    container_image: "img".to_owned(),
+                    container_image: "wl-1".to_owned(),
                     entries: vec![proto::ReferenceEntry {
                         filename: "/a".to_owned(),
                         expected_digest: "02".repeat(48),
@@ -1035,7 +864,7 @@ mod tests {
 
         let latest = service
             .get_latest_verdict(Request::new(proto::GetLatestVerdictRequest {
-                subject: "cgroup:///cg-ref".to_owned(),
+                subject: "workload://wl-ref".to_owned(),
             }))
             .await
             .expect("latest verdict should exist")
@@ -1054,7 +883,7 @@ mod tests {
         let response = service
             .update_latest_verdict(authenticated_update_request(
                 proto::UpdateLatestVerdictRequest {
-                    subjects: vec!["cgroup:///cg-update".to_owned()],
+                    subjects: vec!["workload://wl-update".to_owned()],
                     verdict: proto::Verdict::Stale as i32,
                     message: "heartbeat timeout detected by trustd".to_owned(),
                     policy_action: "restart".to_owned(),
@@ -1069,7 +898,7 @@ mod tests {
 
         let latest = service
             .get_latest_verdict(Request::new(proto::GetLatestVerdictRequest {
-                subject: "cgroup:///cg-update".to_owned(),
+                subject: "workload://wl-update".to_owned(),
             }))
             .await
             .expect("latest verdict should exist")
@@ -1087,7 +916,7 @@ mod tests {
 
         let err = service
             .update_latest_verdict(Request::new(proto::UpdateLatestVerdictRequest {
-                subjects: vec!["cgroup:///cg-update".to_owned()],
+                subjects: vec!["workload://wl-update".to_owned()],
                 verdict: proto::Verdict::Stale as i32,
                 message: "heartbeat timeout detected by trustd".to_owned(),
                 policy_action: "restart".to_owned(),
@@ -1105,7 +934,7 @@ mod tests {
 
         let err = service
             .update_latest_verdict(Request::new(proto::UpdateLatestVerdictRequest {
-                subjects: vec!["cgroup:///cg-update".to_owned()],
+                subjects: vec!["workload://wl-update".to_owned()],
                 verdict: proto::Verdict::Stale as i32,
                 message: "heartbeat timeout detected by trustd".to_owned(),
                 policy_action: "restart".to_owned(),
@@ -1124,7 +953,7 @@ mod tests {
         let err = service
             .update_latest_verdict(authenticated_update_request(
                 proto::UpdateLatestVerdictRequest {
-                    subjects: vec!["cgroup:///cg-update".to_owned()],
+                    subjects: vec!["workload://wl-update".to_owned()],
                     verdict: proto::Verdict::Trusted as i32,
                     message: "manual trust".to_owned(),
                     policy_action: "none".to_owned(),

@@ -22,7 +22,7 @@ async fn spawn_server() -> (
     let store = Arc::new(MemoryStore::new());
     store
         .set(
-            "img",
+            "wl-1",
             vec![ReferenceEntry {
                 filename: "/a".to_owned(),
                 expected_digest: "01".repeat(48),
@@ -48,8 +48,6 @@ async fn spawn_server() -> (
         issuer,
         quote_backend,
         60,
-        std::time::Duration::from_secs(5),
-        1024,
         Some(Arc::<str>::from(TEST_UPDATE_LATEST_VERDICT_TOKEN)),
         "test",
     );
@@ -81,7 +79,7 @@ async fn spawn_server() -> (
 }
 
 #[tokio::test]
-async fn verify_and_health_roundtrip() {
+async fn verify_workload_and_health_roundtrip() {
     let (mut client, shutdown_tx) = spawn_server().await;
 
     let health = client
@@ -91,24 +89,29 @@ async fn verify_and_health_roundtrip() {
         .into_inner();
     assert_eq!(health.status, "healthy");
 
+    // Empty quote + empty event log → verifier returns Untrusted (no refs
+    // match), but the RPC roundtrips and publishes the verdict.
     let verify = client
-        .verify_container_evidence(proto::VerifyRequest {
-            cgroup_path: "cg1".to_owned(),
-            vmi_name: String::new(),
-            vmi_namespace: String::new(),
-            rtmr3: "00".repeat(48),
-            initial_rtmr3: "00".repeat(48),
-            measurements: Vec::new(),
-            nonce: "ab".repeat(32),
-            report_data: String::new(),
+        .verify_workload(proto::VerifyWorkloadRequest {
+            workload_id: "wl-1".to_owned(),
+            nonce_hex: "ab".repeat(32),
             td_quote: Vec::new(),
-            container_image: String::new(),
+            event_log: Vec::new(),
+            peer_pk: Vec::new(),
         })
         .await
-        .expect("verify should succeed")
+        .expect("verify_workload should succeed")
         .into_inner();
-    assert_eq!(verify.verdict, proto::Verdict::Unknown as i32);
-    assert_eq!(verify.policy_action, "none");
+    assert_eq!(verify.verdict, proto::Verdict::Untrusted as i32);
+
+    let latest = client
+        .get_latest_verdict(proto::GetLatestVerdictRequest {
+            subject: "workload://wl-1".to_owned(),
+        })
+        .await
+        .expect("latest verdict should exist")
+        .into_inner();
+    assert_eq!(latest.verdict, verify.verdict);
 
     let _ = shutdown_tx.send(());
 }
@@ -119,7 +122,7 @@ async fn update_latest_verdict_requires_auth_and_roundtrips() {
 
     let err = client
         .update_latest_verdict(proto::UpdateLatestVerdictRequest {
-            subjects: vec!["cgroup:///cg-update".to_owned()],
+            subjects: vec!["workload://wl-update".to_owned()],
             verdict: proto::Verdict::Stale as i32,
             message: "heartbeat timeout detected by trustd".to_owned(),
             policy_action: "restart".to_owned(),
@@ -130,7 +133,7 @@ async fn update_latest_verdict_requires_auth_and_roundtrips() {
     assert_eq!(err.code(), Code::Unauthenticated);
 
     let mut request = Request::new(proto::UpdateLatestVerdictRequest {
-        subjects: vec!["cgroup:///cg-update".to_owned()],
+        subjects: vec!["workload://wl-update".to_owned()],
         verdict: proto::Verdict::Stale as i32,
         message: "heartbeat timeout detected by trustd".to_owned(),
         policy_action: "restart".to_owned(),
@@ -152,7 +155,7 @@ async fn update_latest_verdict_requires_auth_and_roundtrips() {
 
     let latest = client
         .get_latest_verdict(proto::GetLatestVerdictRequest {
-            subject: "cgroup:///cg-update".to_owned(),
+            subject: "workload://wl-update".to_owned(),
         })
         .await
         .expect("latest verdict should exist")

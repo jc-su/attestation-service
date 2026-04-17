@@ -10,8 +10,6 @@ pub const DEFAULT_ISSUER: &str = "trustfncall-attestation-service";
 pub const DEFAULT_TOKEN_TTL_SECONDS: u64 = 300;
 pub const DEFAULT_REFERENCE_STORE_PATH: &str = "/var/lib/trustfncall/reference-values.json";
 pub const DEFAULT_POLICY_RELOAD_SECONDS: u64 = 30;
-pub const DEFAULT_VERIFY_CACHE_TTL_SECONDS: u64 = 5;
-pub const DEFAULT_VERIFY_CACHE_MAX_ENTRIES: usize = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum QuoteVerifierBackend {
@@ -74,14 +72,6 @@ pub struct Config {
     /// Reload interval for --policy-file in seconds.
     #[arg(long, default_value_t = DEFAULT_POLICY_RELOAD_SECONDS)]
     pub policy_reload_seconds: u64,
-
-    /// TTL for VerifyContainerEvidence response cache.
-    #[arg(long, default_value_t = DEFAULT_VERIFY_CACHE_TTL_SECONDS)]
-    pub verify_cache_ttl_seconds: u64,
-
-    /// Maximum number of cached VerifyContainerEvidence responses.
-    #[arg(long, default_value_t = DEFAULT_VERIFY_CACHE_MAX_ENTRIES)]
-    pub verify_cache_max_entries: usize,
 }
 
 impl Config {
@@ -110,9 +100,5 @@ impl Config {
 
     pub fn policy_reload_interval(&self) -> Duration {
         Duration::from_secs(self.policy_reload_seconds)
-    }
-
-    pub fn verify_cache_ttl(&self) -> Duration {
-        Duration::from_secs(self.verify_cache_ttl_seconds)
     }
 }

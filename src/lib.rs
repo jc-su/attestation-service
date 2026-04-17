@@ -11,7 +11,6 @@ pub mod quote_backend;
 pub mod refstore;
 pub mod service;
 pub mod token;
-pub mod verification_cache;
 pub mod verifier;
 
 pub mod proto {

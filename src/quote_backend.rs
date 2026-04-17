@@ -39,6 +39,60 @@ pub struct QuoteVerificationResult {
     pub verification_skipped: bool,
     pub message: String,
     pub attestation_token: Option<String>,
+    /// Hex-encoded RTMR[2] extracted from the quote body, if the backend
+    /// could parse it. Used by the canonical verify_workload flow for the
+    /// TCB check. None = parser did not run (e.g., backend doesn't expose
+    /// it, or quote bytes malformed); caller treats as "skip this check".
+    pub parsed_rtmr2_hex: Option<String>,
+    /// Hex-encoded report_data (64 bytes) extracted from the quote body.
+    /// Used by the canonical verify_workload flow for the nonce+peer_pk
+    /// binding check. None = parser did not run.
+    pub parsed_report_data_hex: Option<String>,
+}
+
+impl QuoteVerificationResult {
+    /// Accessor mirror of the Option for use at the call site.
+    pub fn rtmr2_hex_opt(&self) -> Option<String> {
+        self.parsed_rtmr2_hex.clone()
+    }
+    pub fn report_data_hex_opt(&self) -> Option<String> {
+        self.parsed_report_data_hex.clone()
+    }
+}
+
+/// Parse RTMR[2] and report_data out of a raw TDX v4 quote (TD 1.0 body,
+/// 584-byte report). Returns (rtmr2_hex, report_data_hex) on success.
+/// This is a best-effort parser — only the fields verify_workload needs.
+/// For anything stricter use the DCAP backend's full parser.
+///
+/// TDX v4 quote layout (from Intel DCAP v1.20+ spec):
+///   Header:        0..48   (version, attestation_key_type, tee_type, ...)
+///   Report (TD10): 48..632
+///     tee_tcb_svn       [48..64]
+///     mrseam            [64..112]
+///     mrsignerseam      [112..160]
+///     seamattributes    [160..168]
+///     tdattributes      [168..176]
+///     xfam              [176..184]
+///     mrtd              [184..232]
+///     mrconfigid        [232..280]
+///     mrowner           [280..328]
+///     mrownerconfig     [328..376]
+///     rtmr0             [376..424]
+///     rtmr1             [424..472]
+///     rtmr2             [472..520]
+///     rtmr3             [520..568]
+///     reportdata        [568..632]
+fn parse_td10_quote(bytes: &[u8]) -> Option<(String, String)> {
+    // Minimum size: header (48) + TD10 report (584) = 632 bytes.
+    // Real quotes are larger (include signature material) but those 632
+    // bytes are always at the front.
+    if bytes.len() < 632 {
+        return None;
+    }
+    let rtmr2 = &bytes[472..520];
+    let report_data = &bytes[568..632];
+    Some((hex::encode(rtmr2), hex::encode(report_data)))
 }
 
 #[derive(Debug, Clone)]
@@ -71,17 +125,31 @@ impl QuoteVerifierBackend {
     }
 
     pub fn verify(&self, input: &QuoteBackendInput<'_>) -> Result<QuoteVerificationResult> {
-        match self {
-            Self::Insecure => Ok(QuoteVerificationResult {
+        let mut result = match self {
+            Self::Insecure => QuoteVerificationResult {
                 trust_level: QuoteTrustLevel::Trusted,
                 signature_valid: false,
                 verification_skipped: true,
                 message: "quote signature verification skipped (insecure mode)".to_owned(),
                 attestation_token: None,
-            }),
-            Self::Dcap(backend) => backend.verify(input),
-            Self::Ita(backend) => backend.verify(input),
+                parsed_rtmr2_hex: None,
+                parsed_report_data_hex: None,
+            },
+            Self::Dcap(backend) => backend.verify(input)?,
+            Self::Ita(backend) => backend.verify(input)?,
+        };
+        // RTMR[2] and report_data live at fixed offsets in the TD10 report
+        // body; their location is independent of whether the signature was
+        // verified. Backends that parse them natively (e.g. future ITA JSON
+        // extraction) can set these fields; otherwise we fill from the raw
+        // bytes here so `verify_workload` has a single source of truth.
+        if result.parsed_rtmr2_hex.is_none() || result.parsed_report_data_hex.is_none() {
+            if let Some((rtmr2, report_data)) = parse_td10_quote(input.quote_bytes) {
+                result.parsed_rtmr2_hex.get_or_insert(rtmr2);
+                result.parsed_report_data_hex.get_or_insert(report_data);
+            }
         }
+        Ok(result)
     }
 }
 
@@ -195,6 +263,8 @@ fn map_ita_response(response: ItaCommandResponse) -> Result<QuoteVerificationRes
             .message
             .unwrap_or_else(|| "ita verification completed".to_owned()),
         attestation_token: response.attestation_token.filter(|token| !token.is_empty()),
+        parsed_rtmr2_hex: None,
+        parsed_report_data_hex: None,
     })
 }
 
@@ -326,6 +396,8 @@ fn map_dcap_qv_result(qv_result: u32, collateral_expired: bool) -> QuoteVerifica
         verification_skipped: false,
         message,
         attestation_token: None,
+        parsed_rtmr2_hex: None,
+        parsed_report_data_hex: None,
     }
 }
 

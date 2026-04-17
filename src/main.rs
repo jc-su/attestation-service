@@ -59,8 +59,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
         token_issuer,
         quote_backend,
         config.token_ttl_seconds as i64,
-        config.verify_cache_ttl(),
-        config.verify_cache_max_entries,
         update_latest_verdict_token,
         env!("CARGO_PKG_VERSION"),
     );

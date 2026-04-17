@@ -14,9 +14,11 @@ option go_package = "github.com/trustfncall/attestation-service/proto/v1;attesta
 
 // AttestationService is the Verifier in IETF RATS architecture.
 service AttestationService {
-  // VerifyContainerEvidence verifies attestation evidence from a container
-  // and returns a verdict (TRUSTED/UNTRUSTED/STALE) with an attestation token.
-  rpc VerifyContainerEvidence(VerifyRequest) returns (VerifyResponse);
+  // VerifyWorkload verifies attestation evidence for a workload identified
+  // by its stable workload_id. Inputs come from trustd.AttestWorkload and
+  // include a TDX quote and the kernel's per-container event log. Returns
+  // a verdict, per-check breakdown, and an attestation token on success.
+  rpc VerifyWorkload(VerifyWorkloadRequest) returns (VerifyWorkloadResponse);
 
   // SetReferenceValues uploads reference values for a container image.
   // These are the "known good" measurements that evidence is compared against.
@@ -41,43 +43,6 @@ service AttestationService {
   rpc WatchVerdictUpdates(WatchVerdictUpdatesRequest) returns (stream VerdictUpdate);
 }
 
-// VerifyRequest contains the attestation evidence to verify.
-message VerifyRequest {
-  // Container identifier (cgroup path).
-  string cgroup_path = 1;
-
-  // VMI name and namespace for correlation.
-  string vmi_name = 2;
-  string vmi_namespace = 3;
-
-  // Current RTMR3 value (hex-encoded SHA-384).
-  string rtmr3 = 4;
-
-  // Initial RTMR3 value (hex-encoded SHA-384).
-  string initial_rtmr3 = 5;
-
-  // Ordered measurement log entries.
-  repeated MeasurementEntry measurements = 6;
-
-  // Challenge nonce (hex-encoded).
-  string nonce = 7;
-
-  // Reportdata = SHA384(nonce || rtmr3), hex-encoded.
-  string report_data = 8;
-
-  // Optional: TDX TD Quote (binary).
-  bytes td_quote = 9;
-
-  // Container image reference (e.g., "docker.io/library/nginx:latest").
-  string container_image = 10;
-}
-
-// MeasurementEntry is a single file measurement.
-message MeasurementEntry {
-  string digest = 1;  // SHA-384 hex
-  string file = 2;    // file path
-}
-
 // Verdict is the trust verdict for a container.
 enum Verdict {
   VERDICT_UNSPECIFIED = 0;
@@ -87,53 +52,59 @@ enum Verdict {
   VERDICT_UNKNOWN = 4;
 }
 
-// VerifyResponse contains the verification result.
-message VerifyResponse {
-  // Trust verdict.
-  Verdict verdict = 1;
+// VerifyWorkloadRequest carries per-workload evidence produced by trustd.
+message VerifyWorkloadRequest {
+  // Stable workload identity — the refstore lookup key. Must match the
+  // `workload_id` used by trustd.AttestWorkload.
+  string workload_id = 1;
 
-  // Human-readable message explaining the verdict.
+  // Raw TDX quote bytes (signed by Intel DCAP; contains RTMR[0..3] + report_data).
+  bytes td_quote = 2;
+
+  // Bytes of the kernel's per-container event log at
+  // /sys/kernel/security/ima/container_rtmr/<mangled-cgroup>. Single
+  // JSON object per file.
+  bytes event_log = 3;
+
+  // Verifier-chosen nonce (hex-encoded). Must match what trustd used for
+  // report_data construction.
+  string nonce_hex = 4;
+
+  // Peer public key bytes (empty = no channel binding).
+  bytes peer_pk = 5;
+}
+
+// VerifyWorkloadResponse carries the verdict plus structured per-check breakdown.
+message VerifyWorkloadResponse {
+  Verdict verdict = 1;
   string message = 2;
 
-  // JWT attestation result token (signed by the service).
-  // Contains the verdict, evidence hash, and timestamp.
+  // JWT attestation result token (signed by this service) — empty if
+  // the verdict is not TRUSTED.
   string attestation_token = 3;
 
-  // Details about what matched/mismatched.
-  VerificationDetails details = 4;
+  WorkloadVerificationDetails details = 4;
 
-  // Policy-selected remediation action for this verdict (`none|alert|restart|kill`).
+  // Policy-selected remediation action (`none|alert|restart|kill`).
   string policy_action = 5;
 }
 
-// VerificationDetails provides insight into the verification process.
-message VerificationDetails {
-  // Whether RTMR3 replay matched the reported value.
-  bool rtmr3_replay_valid = 1;
+// WorkloadVerificationDetails provides insight into which subcheck failed.
+message WorkloadVerificationDetails {
+  bool quote_signature_valid = 1;
+  bool quote_verification_skipped = 2;
+  // RTMR[2] in the quote is an enrolled TCB reference (the kernel is genuine).
+  bool tcb_matches = 3;
+  // report_data = SHA384(nonce) || SHA384(peer_pk or 0s).
+  bool report_data_valid = 4;
 
-  // Whether all required reference values were found in measurements.
-  bool all_required_present = 2;
+  int32 matched_count = 5;
+  int32 unknown_count = 6;
+  int32 missing_count = 7;
+  bool all_required_present = 8;
 
-  // Number of measurements matching reference values.
-  int32 matched_count = 3;
-
-  // Number of measurements not in reference values (unknown files).
-  int32 unknown_count = 4;
-
-  // Number of required reference values missing from measurements.
-  int32 missing_count = 5;
-
-  // Whether the TD Quote signature is valid.
-  bool quote_signature_valid = 6;
-
-  // Whether quote verification was skipped (insecure mode).
-  bool quote_verification_skipped = 7;
-
-  // List of unknown files found in measurements.
-  repeated string unknown_files = 8;
-
-  // List of required files missing from measurements.
-  repeated string missing_files = 9;
+  repeated string unknown_files = 9;
+  repeated string missing_files = 10;
 }
 
 // SetReferenceValuesRequest uploads reference values for a container image.

@@ -16,6 +16,105 @@ pub struct ReferenceEntry {
     pub required: bool,
 }
 
+/// Reference values for the TCB-level portion of a TD quote.
+///
+/// Distinct from [`ReferenceValues`] (which describes per-workload file
+/// measurements) — these cover TD firmware, kernel cmdline chain, and
+/// kernel image. A verifier uses them at step 2 of the attestation flow:
+///
+/// > *"Check the TD quote's RTMR[0..2] / MRTD against TCB reference
+/// >   values — this is what makes the kernel's per-container event log
+/// >   trustworthy input (i.e., written by a genuine kernel)."*
+///
+/// Typically one active TCB reference per deployment (one kernel image,
+/// one TD firmware configuration). Multiple entries are allowed for
+/// staged rollouts: during a kernel upgrade, both the old and new
+/// RTMR[2] values are acceptable until all VMs have rolled over.
+///
+/// Fields are hex-encoded. `None` for a field means "skip this check"
+/// (e.g., if MRTD is not pinned because the TD image is rebuilt
+/// frequently). At least `rtmr2_hex` should be set — it is the anchor
+/// that binds the kernel to its per-container event log output.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TcbReferenceValues {
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mrtd_hex: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rtmr0_hex: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rtmr1_hex: Option<String>,
+    pub rtmr2_hex: String,
+    pub created_at: i64,
+}
+
+/// Thread-safe store for TCB reference values. A verifier consults this
+/// alongside [`ReferenceStore`] on every Verify request: the former
+/// certifies "the kernel that produced this evidence is genuine," the
+/// latter certifies "this specific workload matches its baseline."
+pub trait TcbReferenceStore: Send + Sync {
+    fn list(&self) -> Result<Vec<TcbReferenceValues>>;
+    fn add(&self, tcb: TcbReferenceValues) -> Result<()>;
+    fn remove(&self, label: &str) -> Result<()>;
+
+    /// Convenience: returns `Ok(())` iff `rtmr2_hex` matches any stored
+    /// reference's `rtmr2_hex`. This is the fast-path check used in the
+    /// Verifier.
+    fn contains_rtmr2(&self, rtmr2_hex: &str) -> Result<bool> {
+        Ok(self
+            .list()?
+            .iter()
+            .any(|t| t.rtmr2_hex.eq_ignore_ascii_case(rtmr2_hex)))
+    }
+}
+
+/// In-memory TCB reference store. Suitable for deployments where the
+/// TCB reference values are supplied at attestation-service startup
+/// (CLI flag / config file) and never mutated at runtime.
+#[derive(Debug, Default)]
+pub struct MemoryTcbStore {
+    values: RwLock<Vec<TcbReferenceValues>>,
+}
+
+impl MemoryTcbStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_values(values: Vec<TcbReferenceValues>) -> Self {
+        Self {
+            values: RwLock::new(values),
+        }
+    }
+}
+
+impl TcbReferenceStore for MemoryTcbStore {
+    fn list(&self) -> Result<Vec<TcbReferenceValues>> {
+        let guard = self.values.read().map_err(|_| {
+            ServiceError::Internal("tcb reference store poisoned".into())
+        })?;
+        Ok(guard.clone())
+    }
+
+    fn add(&self, tcb: TcbReferenceValues) -> Result<()> {
+        let mut guard = self.values.write().map_err(|_| {
+            ServiceError::Internal("tcb reference store poisoned".into())
+        })?;
+        // Dedup by label: replace if already present.
+        guard.retain(|t| t.label != tcb.label);
+        guard.push(tcb);
+        Ok(())
+    }
+
+    fn remove(&self, label: &str) -> Result<()> {
+        let mut guard = self.values.write().map_err(|_| {
+            ServiceError::Internal("tcb reference store poisoned".into())
+        })?;
+        guard.retain(|t| t.label != label);
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReferenceValues {
     pub container_image: String,
