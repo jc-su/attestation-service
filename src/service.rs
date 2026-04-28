@@ -6,7 +6,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{RwLock, broadcast, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::policy_action_store::{PolicyAction, PolicyActionStore, PolicyCondition};
 use crate::proto;
@@ -433,6 +433,7 @@ impl proto::attestation_service_server::AttestationService for AttestationServic
             return Err(Status::invalid_argument("nonce_hex required"));
         }
 
+        let t_total = Instant::now();
         let result = self
             .verifier
             .verify_workload(&WorkloadVerifyRequest {
@@ -447,6 +448,7 @@ impl proto::attestation_service_server::AttestationService for AttestationServic
         let policy_action = self.resolve_policy_action(&request.workload_id, result.verdict.clone());
         let policy_action_value = policy_action.as_str().to_owned();
 
+        let t_jwt = Instant::now();
         let attestation_token = if matches!(result.verdict, TrustVerdict::Trusted) {
             let claims = Self::build_workload_token_claims(
                 &request.workload_id,
@@ -463,6 +465,28 @@ impl proto::attestation_service_server::AttestationService for AttestationServic
         } else {
             String::new()
         };
+        let jwt_sign_us = t_jwt.elapsed().as_micros() as u64;
+        let total_us = t_total.elapsed().as_micros() as u64;
+
+        // Structured per-call timing record. Emitted as a single line so a
+        // bench parser can grep `stage_breakdown` and reconstruct the CDF
+        // for each sub-stage without re-running anything. Internal-only
+        // (not exposed on the gRPC response).
+        let dcap_us = result.stage_us.iter().find(|(k, _)| *k == "dcap_verify").map(|(_, v)| *v).unwrap_or(0);
+        let tcb_us = result.stage_us.iter().find(|(k, _)| *k == "tcb_match").map(|(_, v)| *v).unwrap_or(0);
+        let rd_us = result.stage_us.iter().find(|(k, _)| *k == "report_data").map(|(_, v)| *v).unwrap_or(0);
+        let ev_us = result.stage_us.iter().find(|(k, _)| *k == "eventlog_replay").map(|(_, v)| *v).unwrap_or(0);
+        info!(
+            event = "stage_breakdown",
+            workload_id = %request.workload_id,
+            verdict = %result.verdict.as_str(),
+            dcap_verify_us = dcap_us,
+            tcb_match_us = tcb_us,
+            report_data_us = rd_us,
+            eventlog_replay_us = ev_us,
+            jwt_sign_us = jwt_sign_us,
+            verify_total_us = total_us,
+        );
 
         let response = proto::VerifyWorkloadResponse {
             verdict: Self::map_verdict(result.verdict.clone()),

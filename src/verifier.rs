@@ -105,6 +105,11 @@ pub struct WorkloadVerifyResult {
     /// Cgroup path parsed from the per-container event log header
     /// (for JWT claim emission).  Empty when event log is not available.
     pub cgroup_path: String,
+    /// Per-stage wall time in microseconds for verify_workload's four
+    /// internal stages: dcap_verify, tcb_match, report_data, eventlog_replay.
+    /// Service-level callers append jwt_sign + verify_total before logging.
+    /// Internal-only (not exposed on the wire).
+    pub stage_us: Vec<(&'static str, u64)>,
 }
 
 impl<S> Verifier<S>
@@ -167,8 +172,10 @@ where
             .map_err(|_| ServiceError::InvalidInput("nonce_hex must be valid hex".to_owned()))?;
 
         let mut hard_failures: Vec<String> = Vec::new();
+        let mut stage_us: Vec<(&'static str, u64)> = Vec::with_capacity(6);
 
         // --- Check 1: quote signature ---
+        let t0 = std::time::Instant::now();
         let (quote_signature_valid, quote_verification_skipped, parsed_quote) =
             if req.td_quote.is_empty() {
                 (false, true, None)
@@ -185,12 +192,14 @@ where
                 }
                 (outcome.signature_valid, outcome.verification_skipped, Some(outcome))
             };
+        stage_us.push(("dcap_verify", t0.elapsed().as_micros() as u64));
 
         // --- Check 2: TCB ∈ TCB references ---
         // Each populated field on the TCB ref-set must match the quote's
         // value. Empty allow-lists mean "skip this measurement". The
         // matching ref-set is selected as a self-consistent tuple — see
         // `TcbReferenceStore::measurement_allowed`.
+        let t1 = std::time::Instant::now();
         let tcb_matches = match (&self.tcb_store, &parsed_quote) {
             (None, _) => true, // not configured → skip
             (Some(_), None) => {
@@ -237,8 +246,11 @@ where
             }
         };
 
+        stage_us.push(("tcb_match", t1.elapsed().as_micros() as u64));
+
         // --- Check 3: report_data binding ---
         // Expected: SHA384(nonce)[..32] || SHA384(peer_pk)[..32] (or 0s).
+        let t2 = std::time::Instant::now();
         let mut expected_report_data = [0_u8; 64];
         let nonce_hash = Sha384::digest(&nonce_bytes);
         expected_report_data[..32].copy_from_slice(&nonce_hash[..32]);
@@ -268,7 +280,10 @@ where
             },
         };
 
+        stage_us.push(("report_data", t2.elapsed().as_micros() as u64));
+
         // --- Per-workload measurement replay ---
+        let t3 = std::time::Instant::now();
         let parsed_log = parse_event_log(&req.event_log)?;
         let measurements = parsed_log.measurements;
         let cgroup_path = parsed_log.cgroup;
@@ -315,6 +330,7 @@ where
         if !all_required_present {
             hard_failures.push(format!("{} required reference file(s) missing", missing_count));
         }
+        stage_us.push(("eventlog_replay", t3.elapsed().as_micros() as u64));
 
         let verdict = if hard_failures.is_empty() {
             TrustVerdict::Trusted
@@ -356,6 +372,7 @@ where
             rtmr2_hex,
             rtmr3_hex,
             cgroup_path,
+            stage_us,
         })
     }
 }
