@@ -1,1 +1,4 @@
 /target
+
+# Claude Code session transcripts (large, session-specific).
+*-this-session-is-being-continued-from-a-previous-c*.txt

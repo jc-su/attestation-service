@@ -82,8 +82,9 @@ pub struct WorkloadVerifyResult {
     pub verdict: TrustVerdict,
     pub quote_signature_valid: bool,
     pub quote_verification_skipped: bool,
-    /// RTMR[2] in quote matches at least one TcbReferenceValues entry.
-    /// True if tcb_store is None (check skipped).
+    /// MRTD + RTMR[0..2] in quote match TcbReferenceValues. True if
+    /// tcb_store is None (check skipped) or all populated TCB fields
+    /// match at least one entry's allow-list.
     pub tcb_matches: bool,
     /// report_data == SHA384(nonce) || SHA384(peer_pk or 0s).
     pub report_data_valid: bool,
@@ -94,6 +95,16 @@ pub struct WorkloadVerifyResult {
     pub unknown_files: Vec<String>,
     pub missing_files: Vec<String>,
     pub message: String,
+    /// Hex-encoded MRTD parsed from quote (for JWT claim emission).
+    pub mrtd_hex: Option<String>,
+    /// Hex-encoded RTMR[0..3] parsed from quote (for JWT claim emission).
+    pub rtmr0_hex: Option<String>,
+    pub rtmr1_hex: Option<String>,
+    pub rtmr2_hex: Option<String>,
+    pub rtmr3_hex: Option<String>,
+    /// Cgroup path parsed from the per-container event log header
+    /// (for JWT claim emission).  Empty when event log is not available.
+    pub cgroup_path: String,
 }
 
 impl<S> Verifier<S>
@@ -175,7 +186,11 @@ where
                 (outcome.signature_valid, outcome.verification_skipped, Some(outcome))
             };
 
-        // --- Check 2: RTMR[2] ∈ TCB references ---
+        // --- Check 2: TCB ∈ TCB references ---
+        // Each populated field on the TCB ref-set must match the quote's
+        // value. Empty allow-lists mean "skip this measurement". The
+        // matching ref-set is selected as a self-consistent tuple — see
+        // `TcbReferenceStore::measurement_allowed`.
         let tcb_matches = match (&self.tcb_store, &parsed_quote) {
             (None, _) => true, // not configured → skip
             (Some(_), None) => {
@@ -185,16 +200,40 @@ where
                 false
             }
             (Some(store), Some(q)) => {
-                let rtmr2_hex = q.rtmr2_hex_opt().unwrap_or_default();
-                if rtmr2_hex.is_empty() {
-                    hard_failures.push("quote does not expose RTMR[2]".into());
-                    false
-                } else if !store.contains_rtmr2(&rtmr2_hex)? {
-                    hard_failures.push(format!("RTMR[2]={} not in TCB reference set", rtmr2_hex));
-                    false
-                } else {
-                    true
+                let mrtd = q.mrtd_hex_opt();
+                let r0 = q.rtmr0_hex_opt();
+                let r1 = q.rtmr1_hex_opt();
+                let r2 = q.rtmr2_hex_opt();
+                let mut ok = true;
+                if !store.allows_mrtd(mrtd.as_deref())? {
+                    hard_failures.push(format!(
+                        "MRTD={} not in TCB reference set",
+                        mrtd.as_deref().unwrap_or("<unparsed>")
+                    ));
+                    ok = false;
                 }
+                if !store.allows_rtmr0(r0.as_deref())? {
+                    hard_failures.push(format!(
+                        "RTMR[0]={} not in TCB reference set",
+                        r0.as_deref().unwrap_or("<unparsed>")
+                    ));
+                    ok = false;
+                }
+                if !store.allows_rtmr1(r1.as_deref())? {
+                    hard_failures.push(format!(
+                        "RTMR[1]={} not in TCB reference set",
+                        r1.as_deref().unwrap_or("<unparsed>")
+                    ));
+                    ok = false;
+                }
+                if !store.allows_rtmr2(r2.as_deref())? {
+                    hard_failures.push(format!(
+                        "RTMR[2]={} not in TCB reference set",
+                        r2.as_deref().unwrap_or("<unparsed>")
+                    ));
+                    ok = false;
+                }
+                ok
             }
         };
 
@@ -230,7 +269,9 @@ where
         };
 
         // --- Per-workload measurement replay ---
-        let measurements = parse_event_log(&req.event_log)?;
+        let parsed_log = parse_event_log(&req.event_log)?;
+        let measurements = parsed_log.measurements;
+        let cgroup_path = parsed_log.cgroup;
         let mut matched_count = 0_i32;
         let mut unknown_count = 0_i32;
         let mut missing_count = 0_i32;
@@ -286,6 +327,16 @@ where
             hard_failures.join("; ")
         };
 
+        let (mrtd_hex, rtmr0_hex, rtmr1_hex, rtmr2_hex, rtmr3_hex) = match &parsed_quote {
+            Some(q) => (
+                q.mrtd_hex_opt(),
+                q.rtmr0_hex_opt(),
+                q.rtmr1_hex_opt(),
+                q.rtmr2_hex_opt(),
+                q.rtmr3_hex_opt(),
+            ),
+            None => (None, None, None, None, None),
+        };
         Ok(WorkloadVerifyResult {
             verdict,
             quote_signature_valid,
@@ -299,19 +350,37 @@ where
             unknown_files,
             missing_files,
             message,
+            mrtd_hex,
+            rtmr0_hex,
+            rtmr1_hex,
+            rtmr2_hex,
+            rtmr3_hex,
+            cgroup_path,
         })
     }
 }
 
-/// Parse the kernel's per-container event log into `MeasurementLog`
-/// entries. The kernel emits a single JSON object per file, shape:
+/// Parsed per-container event log: header (`cgroup`, baseline) +
+/// `measurements`. Kept as a small struct so the canonical
+/// verify_workload flow can lift `cgroup` straight into the JWT
+/// `cgroup_path` claim without re-parsing the raw bytes.
+struct ParsedEventLog {
+    cgroup: String,
+    measurements: Vec<MeasurementLog>,
+}
+
+/// Parse the kernel's per-container event log. The kernel emits a single
+/// JSON object per file, shape:
 /// `{"cgroup": ..., "baseline": ..., "count": N,
 ///   "measurements": [{"digest": hex, "file": path}, ...]}`
 /// (see `security/integrity/ima/ima_container.c` and
 /// `DEVELOPER_GUIDE_CONTAINER_RTMR3.md`).
-fn parse_event_log(bytes: &[u8]) -> Result<Vec<MeasurementLog>> {
+fn parse_event_log(bytes: &[u8]) -> Result<ParsedEventLog> {
     if bytes.is_empty() {
-        return Ok(Vec::new());
+        return Ok(ParsedEventLog {
+            cgroup: String::new(),
+            measurements: Vec::new(),
+        });
     }
     #[derive(Debug, serde::Deserialize)]
     struct LogEntry {
@@ -323,6 +392,8 @@ fn parse_event_log(bytes: &[u8]) -> Result<Vec<MeasurementLog>> {
     #[derive(Debug, serde::Deserialize)]
     struct LogFile {
         #[serde(default)]
+        cgroup: String,
+        #[serde(default)]
         measurements: Vec<LogEntry>,
     }
 
@@ -331,15 +402,18 @@ fn parse_event_log(bytes: &[u8]) -> Result<Vec<MeasurementLog>> {
     let doc: LogFile = serde_json::from_str(text)
         .map_err(|e| ServiceError::Parse(format!("event_log JSON: {e}")))?;
 
-    Ok(doc
-        .measurements
-        .into_iter()
-        .filter(|e| !e.digest.is_empty() && !e.file.is_empty())
-        .map(|e| MeasurementLog {
-            digest: e.digest,
-            filename: e.file,
-        })
-        .collect())
+    Ok(ParsedEventLog {
+        cgroup: doc.cgroup,
+        measurements: doc
+            .measurements
+            .into_iter()
+            .filter(|e| !e.digest.is_empty() && !e.file.is_empty())
+            .map(|e| MeasurementLog {
+                digest: e.digest,
+                filename: e.file,
+            })
+            .collect(),
+    })
 }
 
 #[cfg(test)]

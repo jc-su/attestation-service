@@ -19,32 +19,48 @@ pub struct ReferenceEntry {
 /// Reference values for the TCB-level portion of a TD quote.
 ///
 /// Distinct from [`ReferenceValues`] (which describes per-workload file
-/// measurements) — these cover TD firmware, kernel cmdline chain, and
-/// kernel image. A verifier uses them at step 2 of the attestation flow:
+/// measurements) — these cover TD firmware, kernel-image, kernel-cmdline
+/// chain. A verifier uses them at step 2 of the attestation flow:
 ///
-/// > *"Check the TD quote's RTMR[0..2] / MRTD against TCB reference
+/// > *"Check the TD quote's MRTD / RTMR[0..2] against TCB reference
 /// >   values — this is what makes the kernel's per-container event log
 /// >   trustworthy input (i.e., written by a genuine kernel)."*
 ///
-/// Typically one active TCB reference per deployment (one kernel image,
-/// one TD firmware configuration). Multiple entries are allowed for
-/// staged rollouts: during a kernel upgrade, both the old and new
-/// RTMR[2] values are acceptable until all VMs have rolled over.
+/// Each field is a `Vec<String>` of acceptable lowercase-hex SHA-384
+/// digests, encoding "any-of" semantics for staged rollout: during a
+/// kernel upgrade both the old and new RTMR[1]/RTMR[2] values are
+/// acceptable until all TDs have rolled over.  An empty `Vec` means
+/// "skip this check" (e.g. MRTD is left empty by KubeVirt's direct
+/// kernel-boot flow, so there is nothing to pin there).
 ///
-/// Fields are hex-encoded. `None` for a field means "skip this check"
-/// (e.g., if MRTD is not pinned because the TD image is rebuilt
-/// frequently). At least `rtmr2_hex` should be set — it is the anchor
-/// that binds the kernel to its per-container event log output.
+/// At least one of `rtmr1_hex` or `rtmr2_hex` must be non-empty — they
+/// are the security anchors that bind the running kernel to its
+/// per-container event log output.  RTMR[3] is intentionally NOT
+/// modeled here: in this design RTMR[3] is a CVM-shared accumulator
+/// extended by every container; per-container measurements live in a
+/// kernel-emitted virtual event log under
+/// `/sys/kernel/security/ima/container_rtmr/<cgroup>` and are matched
+/// against [`ReferenceStore`] entries instead.
+///
+/// Field convention follows Confidential Containers Trustee, Microsoft
+/// Azure Attestation, Intel Trust Authority, and Edgeless Contrast:
+/// lowercase 96-char hex of the raw 48-byte SHA-384.  The IETF RATS
+/// CoRIM trajectory (`draft-ietf-rats-corim` + Intel profile
+/// `draft-cds-rats-intel-corim-profile`) would carry the same digests
+/// in CBOR `bstr` — adopting it is a serializer change, not a model
+/// change.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TcbReferenceValues {
     pub label: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mrtd_hex: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rtmr0_hex: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rtmr1_hex: Option<String>,
-    pub rtmr2_hex: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mrtd_hex: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rtmr0_hex: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rtmr1_hex: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rtmr2_hex: Vec<String>,
+    #[serde(default)]
     pub created_at: i64,
 }
 
@@ -52,20 +68,61 @@ pub struct TcbReferenceValues {
 /// alongside [`ReferenceStore`] on every Verify request: the former
 /// certifies "the kernel that produced this evidence is genuine," the
 /// latter certifies "this specific workload matches its baseline."
+///
+/// The four `allows_*` methods all share the same semantics:
+///   - `Ok(true)` if the store has no entries (treat as misconfig → skip)
+///   - `Ok(true)` if there exists an entry whose corresponding allow-list
+///     is empty (explicit skip-this-measurement) OR contains a
+///     case-insensitive match for `candidate_hex`
+///   - `Ok(false)` otherwise
+///
+/// The trait is kept dyn-safe by giving each measurement register its
+/// own concrete method (no generic-fn dispatch).
 pub trait TcbReferenceStore: Send + Sync {
     fn list(&self) -> Result<Vec<TcbReferenceValues>>;
     fn add(&self, tcb: TcbReferenceValues) -> Result<()>;
     fn remove(&self, label: &str) -> Result<()>;
 
-    /// Convenience: returns `Ok(())` iff `rtmr2_hex` matches any stored
-    /// reference's `rtmr2_hex`. This is the fast-path check used in the
-    /// Verifier.
-    fn contains_rtmr2(&self, rtmr2_hex: &str) -> Result<bool> {
-        Ok(self
-            .list()?
-            .iter()
-            .any(|t| t.rtmr2_hex.eq_ignore_ascii_case(rtmr2_hex)))
+    fn allows_mrtd(&self, candidate_hex: Option<&str>) -> Result<bool> {
+        any_match(self.list()?, candidate_hex, |t| &t.mrtd_hex)
     }
+    fn allows_rtmr0(&self, candidate_hex: Option<&str>) -> Result<bool> {
+        any_match(self.list()?, candidate_hex, |t| &t.rtmr0_hex)
+    }
+    fn allows_rtmr1(&self, candidate_hex: Option<&str>) -> Result<bool> {
+        any_match(self.list()?, candidate_hex, |t| &t.rtmr1_hex)
+    }
+    fn allows_rtmr2(&self, candidate_hex: Option<&str>) -> Result<bool> {
+        any_match(self.list()?, candidate_hex, |t| &t.rtmr2_hex)
+    }
+
+    /// Backwards-compatible name kept for direct RTMR[2] checks
+    /// (existing tests / external callers).
+    fn contains_rtmr2(&self, rtmr2_hex: &str) -> Result<bool> {
+        self.allows_rtmr2(Some(rtmr2_hex))
+    }
+}
+
+/// Shared helper for the four `allows_*` methods.  Empty store → skip;
+/// a per-entry empty allow-list → skip; otherwise require a match.
+fn any_match<F>(
+    entries: Vec<TcbReferenceValues>,
+    candidate_hex: Option<&str>,
+    select: F,
+) -> Result<bool>
+where
+    F: Fn(&TcbReferenceValues) -> &Vec<String>,
+{
+    if entries.is_empty() {
+        return Ok(true);
+    }
+    Ok(entries.iter().any(|t| {
+        let allow = select(t);
+        allow.is_empty()
+            || candidate_hex
+                .map(|c| allow.iter().any(|v| v.eq_ignore_ascii_case(c)))
+                .unwrap_or(false)
+    }))
 }
 
 /// In-memory TCB reference store. Suitable for deployments where the
@@ -85,6 +142,36 @@ impl MemoryTcbStore {
         Self {
             values: RwLock::new(values),
         }
+    }
+
+    /// Load TCB reference values from a JSON file. Format is a top-level
+    /// array of `TcbReferenceValues` objects, e.g.:
+    ///
+    /// ```json
+    /// [
+    ///   {
+    ///     "label": "linux-6.6-default",
+    ///     "rtmr1_hex": ["15f689dbb5..."],
+    ///     "rtmr2_hex": ["0b34c7a5c4..."]
+    ///   }
+    /// ]
+    /// ```
+    ///
+    /// `mrtd_hex`, `rtmr0_hex`, `rtmr1_hex`, `rtmr2_hex` are all
+    /// optional `Vec<String>`s — omitted or `[]` means "skip this
+    /// check" for that measurement register.
+    pub fn from_file(path: impl AsRef<Path>) -> Result<Self> {
+        let raw = fs::read(path.as_ref())?;
+        if raw.is_empty() {
+            return Ok(Self::default());
+        }
+        let values: Vec<TcbReferenceValues> = serde_json::from_slice(&raw).map_err(|e| {
+            ServiceError::Parse(format!(
+                "parse TCB reference store {}: {e}",
+                path.as_ref().display()
+            ))
+        })?;
+        Ok(Self::with_values(values))
     }
 }
 

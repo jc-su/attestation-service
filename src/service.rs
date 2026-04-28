@@ -343,14 +343,30 @@ impl AttestationService {
         TokenClaims {
             verdict: result.verdict.as_str().to_owned(),
             policy_action: policy_action.as_str().to_owned(),
-            cgroup_path: String::new(),
+            // cgroup_path comes from the kernel-emitted per-container
+            // event-log header — populated when the request carried
+            // event_log bytes; empty otherwise.
+            cgroup_path: result.cgroup_path.clone(),
             container_image: format!("workload://{workload_id}"),
+            // vmi_{name,namespace} are not part of the workload-evidence
+            // wire format. Left empty by design — relying parties that
+            // need K8s identity should consume the JWT claim
+            // `container_image` (workload://<id>) and resolve out-of-band.
             vmi_name: String::new(),
             vmi_namespace: String::new(),
-            rtmr3: String::new(),
+            // rtmr3 is the CVM-shared accumulator at attestation time —
+            // useful as JWT evidence even though it is *not* gated by
+            // the TCB check (per-container measurements live in
+            // event_log, not RTMR[3]).
+            rtmr3: result.rtmr3_hex.clone().unwrap_or_default(),
             measurement_count: (result.matched_count + result.unknown_count) as i32,
             matched_count: result.matched_count,
             unknown_count: result.unknown_count,
+            // This verifier intentionally does not perform an RTMR[3]
+            // replay (per-container measurements come from the
+            // virtual event log, not from extending RTMR[3]). Claim
+            // is left false; relying parties should rely on
+            // matched_count + all_required_present instead.
             rtmr3_replay_valid: false,
             all_required_present: result.all_required_present,
             quote_verified: result.quote_signature_valid,

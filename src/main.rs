@@ -7,7 +7,9 @@ use attestation_service::policy_action_store::InMemoryPolicyActionStore;
 use attestation_service::policy_sync::PolicyFileSync;
 use attestation_service::proto;
 use attestation_service::quote_backend::QuoteVerifierBackend;
-use attestation_service::refstore::{PersistentFileStore, PolicyReferenceStore, ReferenceStore};
+use attestation_service::refstore::{
+    MemoryTcbStore, PersistentFileStore, PolicyReferenceStore, ReferenceStore, TcbReferenceStore,
+};
 use attestation_service::service::AttestationService;
 use attestation_service::token::TokenIssuer;
 use clap::Parser;
@@ -53,7 +55,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     if update_latest_verdict_token.is_none() {
         warn!("no --update-latest-verdict-token-path provided; UpdateLatestVerdict is disabled");
     }
-    let service = AttestationService::new(
+    let mut service = AttestationService::new(
         reference_store,
         policy_action_store.clone(),
         token_issuer,
@@ -62,6 +64,30 @@ async fn main() -> Result<(), Box<dyn Error>> {
         update_latest_verdict_token,
         env!("CARGO_PKG_VERSION"),
     );
+
+    // TCB reference store: load MRTD + RTMR[0..2] allow-list from JSON
+    // when --tcb-ref-path is given. Without it, the TCB check inside
+    // verify_workload is skipped (fail-open on the kernel-genuineness
+    // dimension) — we log a loud warning so operators notice.
+    if let Some(tcb_path) = config.tcb_ref_path.as_ref() {
+        match MemoryTcbStore::from_file(tcb_path) {
+            Ok(tcb_store) => {
+                let count = tcb_store.list().map(|v| v.len()).unwrap_or(0);
+                info!(
+                    path = %tcb_path.display(),
+                    entries = count,
+                    "TCB reference store loaded; verify_workload will gate MRTD + RTMR[0..2]"
+                );
+                service = service.with_tcb_store(Arc::new(tcb_store) as Arc<dyn TcbReferenceStore>);
+            }
+            Err(e) => {
+                warn!(path = %tcb_path.display(), error = %e,
+                    "failed to load --tcb-ref-path; TCB check will be skipped");
+            }
+        }
+    } else {
+        warn!("no --tcb-ref-path provided; TCB MRTD/RTMR check is SKIPPED (fail-open)");
+    }
 
     let _policy_sync_handle = if !config.policy_file.is_empty() {
         let sync = Arc::new(PolicyFileSync::new(

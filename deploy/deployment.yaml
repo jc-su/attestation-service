@@ -18,12 +18,29 @@ spec:
         app: attestation-service
     spec:
       serviceAccountName: attestation-service
+      # Pod runs in the host network namespace so it can reach the host's
+      # PCCS daemon at https://localhost:8081 for DCAP collateral. The
+      # SGX/TDX DCAP libraries (libsgx-dcap-quote-verify) baked into the
+      # image don't traverse a pod->host gateway cleanly.
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
       containers:
         - name: attestation-service
-          image: ghcr.io/trustfncall/attestation-service:latest
+          # Image is built locally (see infra/attestation-service/Dockerfile +
+          # tdx-guest/build-all.sh) and imported into k3s containerd via:
+          #   docker save | sudo k3s ctr -n k8s.io images import -
+          image: localhost/trustweave-attestation-service:latest
+          imagePullPolicy: IfNotPresent
           args:
-            - --addr=:50051
-            - --insecure-skip-quote-verify  # Remove in production
+            # Quote signature verification path: real Intel DCAP via
+            # libsgx-dcap-quote-verify + PCCS at localhost:8081.
+            # The earlier --insecure-skip-quote-verify bypass has been removed.
+            - --addr=0.0.0.0:50051
+            - --reference-store-path=/tmp/reference-values.json
+            # TCB allow-list (MRTD + RTMR[0..2]) loaded from configmap.
+            # Without this flag the verifier is fail-open on the kernel-
+            # genuineness dimension; warned about loudly at startup.
+            - --tcb-ref-path=/etc/attestation-service/tcb.json
           ports:
             - containerPort: 50051
               name: grpc
@@ -36,12 +53,20 @@ spec:
               memory: "256Mi"
               cpu: "500m"
           livenessProbe:
-            grpc:
+            tcpSocket:
               port: 50051
-            initialDelaySeconds: 5
+            initialDelaySeconds: 10
             periodSeconds: 10
           readinessProbe:
-            grpc:
+            tcpSocket:
               port: 50051
             initialDelaySeconds: 3
             periodSeconds: 5
+          volumeMounts:
+            - name: tcb-ref
+              mountPath: /etc/attestation-service
+              readOnly: true
+      volumes:
+        - name: tcb-ref
+          configMap:
+            name: as-tcb-ref

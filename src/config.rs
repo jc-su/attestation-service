@@ -65,6 +65,15 @@ pub struct Config {
     #[arg(long, default_value = DEFAULT_REFERENCE_STORE_PATH)]
     pub reference_store_path: PathBuf,
 
+    /// Optional JSON file holding TCB reference values
+    /// (`Vec<TcbReferenceValues>`) — one entry per kernel/firmware
+    /// configuration this verifier accepts. When set, MRTD + RTMR[0..2]
+    /// are checked against this allow-list on every VerifyWorkload
+    /// request. When unset, the TCB check is skipped and the verifier
+    /// is fail-open on that dimension (logged as a warning at startup).
+    #[arg(long)]
+    pub tcb_ref_path: Option<PathBuf>,
+
     /// Path to AttestationPolicy YAML file(s). Can be repeated.
     #[arg(long)]
     pub policy_file: Vec<PathBuf>,

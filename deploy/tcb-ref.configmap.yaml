@@ -1,0 +1,49 @@
+# TCB reference values for the canonical "linux-6.6 + custom-kernel
+# qcow2" launch we use across the ablation. Loaded by attestation-service
+# at startup via --tcb-ref-path=/etc/attestation-service/tcb.json (see
+# deployment.yaml volumeMounts).
+#
+# Format: array of TcbReferenceValues (Vec<String> any-of semantics for
+# each measurement register). Empty arrays mean "skip this check".
+#
+# How these values were captured (one-time, on a known-good boot):
+#   1. Boot the VMI with the canonical bundle.
+#   2. From inside the guest, call trustd.AttestWorkload to obtain a
+#      live quote, then run scripts/parse_quote.py on the quote bytes
+#      (or read attestation-service WARN log "RTMR[N]=<hex> not in TCB
+#      reference set" on a deliberate-mismatch verify).
+#   3. Drop hex strings into the per-register `*_hex` arrays.
+#
+# MRTD is left empty: KubeVirt's direct kernel-boot flow does not
+# extend MRTD with launch measurements (security relies on RTMR[1] and
+# RTMR[2]). For deployments that DO measure into MRTD, populate it.
+#
+# Staged-rollout: a new kernel CL ships with both old and new RTMR[2]
+# in the array until all TDs have rolled over. Same for RTMR[0]/RTMR[1].
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: as-tcb-ref
+  namespace: kubevirt
+  labels:
+    app: attestation-service
+    app.kubernetes.io/component: attestation
+    app.kubernetes.io/part-of: trustfncall
+data:
+  tcb.json: |
+    [
+      {
+        "label": "linux-6.6-default-2026-04-28",
+        "mrtd_hex": [],
+        "rtmr0_hex": [
+          "4f7899503fe4ab5ec081b79818ffd0fd23dead6b33e72e81ff7c15feb83a17cd57fd431dd55d77b42d7c064b3a65c5bd"
+        ],
+        "rtmr1_hex": [
+          "36728ff249702b6befc614c493e42c756701f17b7c086fdf1547f65fe07891b964987292f131f56e4f837d2b08c7fefd"
+        ],
+        "rtmr2_hex": [
+          "15f689dbb5531c61310d875f96933bff34fe7e7a31d66108a6af8e1aae19dba4dddd9fecda1d3b76441ce82e4d7e88f6"
+        ],
+        "created_at": 1777581000
+      }
+    ]
