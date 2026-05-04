@@ -294,6 +294,8 @@ where
         let mut missing_files: Vec<String> = Vec::new();
         let mut all_required_present = true;
 
+        let mut drift_count = 0_i32;
+        let mut drift_files: Vec<String> = Vec::new();
         match self.ref_store.get(&req.workload_id) {
             Ok(refs) => {
                 let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
@@ -306,8 +308,27 @@ where
                         matched_count += 1;
                         seen.insert(e.filename.as_str());
                     } else {
-                        unknown_count += 1;
-                        unknown_files.push(m.filename.clone());
+                        // Strict-mode drift detection: a measurement whose
+                        // filename matches a tracked reference but whose
+                        // digest does not match is drift, not just unknown.
+                        // (Drift = post-attestation file mutation, the
+                        // exact case TrustFnCall E1b is designed to catch.)
+                        let filename_tracked = refs
+                            .entries
+                            .iter()
+                            .any(|e| e.filename == m.filename);
+                        if filename_tracked {
+                            drift_count += 1;
+                            let preview = if m.digest.len() >= 16 {
+                                &m.digest[..16]
+                            } else {
+                                m.digest.as_str()
+                            };
+                            drift_files.push(format!("{}@{}", m.filename, preview));
+                        } else {
+                            unknown_count += 1;
+                            unknown_files.push(m.filename.clone());
+                        }
                     }
                 }
                 for e in &refs.entries {
@@ -329,6 +350,13 @@ where
 
         if !all_required_present {
             hard_failures.push(format!("{} required reference file(s) missing", missing_count));
+        }
+        if drift_count > 0 {
+            hard_failures.push(format!(
+                "{} drifted measurement(s): {}",
+                drift_count,
+                drift_files.join(", ")
+            ));
         }
         stage_us.push(("eventlog_replay", t3.elapsed().as_micros() as u64));
 
